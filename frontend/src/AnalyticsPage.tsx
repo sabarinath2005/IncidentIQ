@@ -23,7 +23,7 @@ export default function AnalyticsPage({ project }: Props) {
     { label: "AI investigations", value: data?.investigation_total ?? "—", hint: "Root-cause runs", Icon: Sparkles },
     { label: "Approval decisions", value: data?.approval_total ?? "—", hint: "Human-in-the-loop", Icon: ShieldCheck },
     { label: "Knowledge runbooks", value: data?.knowledge_docs_total ?? "—", hint: "1536-dim embeddings", Icon: BookOpen },
-    { label: "AI provider mode", value: data?.ai_provider_mode ? data.ai_provider_mode.toUpperCase() : "DEMO", hint: "Transparent provenance", Icon: Gauge },
+    { label: "AI provider mode", value: data?.ai_provider_mode ? (typeof data.ai_provider_mode === "string" ? data.ai_provider_mode : String((data.ai_provider_mode as Record<string, unknown>)?.provider ?? (data.ai_provider_mode as Record<string, unknown>)?.mode ?? "OPENAI")).toUpperCase() : "DEMO", hint: "Transparent provenance", Icon: Gauge },
   ];
 
   return <div className="space-y-6">
