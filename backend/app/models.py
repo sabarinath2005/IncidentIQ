@@ -304,6 +304,11 @@ class Deployment(Base):
     commit_ref: Mapped[str] = mapped_column(String(160), default="")
     deployed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     environment: Mapped[str] = mapped_column(String(80), default="demo")
+    provider: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    external_id: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    repository_full_name: Mapped[str] = mapped_column(String(240), default="", nullable=False)
+    correlation_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    deployment_status: Mapped[str] = mapped_column(String(40), default="unknown", nullable=False)
     __table_args__ = (ForeignKeyConstraint(["workspace_id", "project_id", "service_id"], ["services.workspace_id", "services.project_id", "services.id"], ondelete="CASCADE"),)
 
 
@@ -320,6 +325,13 @@ class InvestigationRun(Base):
     workflow_version: Mapped[str] = mapped_column(String(40), default="mvp-1")
     prompt_version: Mapped[str] = mapped_column(String(40), default="mock-1")
     model_id: Mapped[str] = mapped_column(String(120), default="mock-demo")
+    provider_name: Mapped[str] = mapped_column(String(40), default="unknown", nullable=False)
+    provider_mode: Mapped[str] = mapped_column(String(24), default="unknown", nullable=False)
+    model_version: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    model_duration_ms: Mapped[int | None] = mapped_column(Integer)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_summary: Mapped[str] = mapped_column(Text, default="")
@@ -426,9 +438,20 @@ class KnowledgeDocument(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     outcome: Mapped[str] = mapped_column(Text, default="")
+    filename: Mapped[str] = mapped_column(String(240), default="", nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(120), default="text/plain", nullable=False)
+    file_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
+    processing_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("workspace_id", "project_id", "id"),
         ForeignKeyConstraint(["workspace_id", "project_id"], ["projects.workspace_id", "projects.id"], ondelete="CASCADE"),
+        CheckConstraint("status in ('pending','processing','indexed','failed','removed')", name="ck_knowledge_document_status"),
     )
 
 
@@ -440,13 +463,22 @@ class DocumentChunk(Base):
     document_id: Mapped[object] = mapped_column(Uuid, nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Preserve the original demo vector column for existing installations.
+    # Real provider vectors use a separate fixed-dimension column so distances
+    # can never compare incompatible models or vector sizes.
     embedding: Mapped[list | None] = mapped_column(Vector(64))
     embedding_model: Mapped[str] = mapped_column(String(120), default="demo-hash-v1")
+    embedding_1536: Mapped[list | None] = mapped_column(Vector(1536))
+    embedding_1536_model: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    embedding_1536_dimensions: Mapped[int | None] = mapped_column(Integer)
     __table_args__ = (
         UniqueConstraint("document_id", "chunk_index"),
+        UniqueConstraint("workspace_id", "project_id", "document_id", "id", name="uq_document_chunk_scope_id"),
         ForeignKeyConstraint(["workspace_id", "project_id", "document_id"], ["knowledge_documents.workspace_id", "knowledge_documents.project_id", "knowledge_documents.id"], ondelete="CASCADE"),
         Index("ix_doc_chunks_project", "project_id", "document_id"),
         Index("ix_doc_chunks_embedding", "embedding", postgresql_using="hnsw", postgresql_ops={"embedding": "vector_cosine_ops"}),
+        Index("ix_doc_chunks_embedding_1536", "embedding_1536", postgresql_using="hnsw", postgresql_ops={"embedding_1536": "vector_cosine_ops"}),
+        CheckConstraint("(embedding_1536 is null and embedding_1536_dimensions is null) or (embedding_1536 is not null and embedding_1536_dimensions = 1536 and embedding_1536_model <> '')", name="ck_document_chunk_embedding_1536_dimensions"),
     )
 
 
@@ -463,6 +495,11 @@ class InvestigationRunContextReference(Base):
     source_incident_id: Mapped[object | None] = mapped_column(Uuid)
     source_evidence_id: Mapped[object | None] = mapped_column(Uuid)
     source_document_id: Mapped[object | None] = mapped_column(Uuid)
+    source_chunk_id: Mapped[object | None] = mapped_column(Uuid)
+    source_document_version: Mapped[int | None] = mapped_column(Integer)
+    source_chunk_index: Mapped[int | None] = mapped_column(Integer)
+    source_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_excerpt: Mapped[str] = mapped_column(Text, default="", nullable=False)
     retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     retrieval_rank: Mapped[int] = mapped_column(Integer, nullable=False)
     retrieval_score: Mapped[float] = mapped_column(Float, nullable=False)
@@ -474,6 +511,9 @@ class InvestigationRunContextReference(Base):
         ForeignKeyConstraint(["origin_workspace_id", "origin_project_id", "source_incident_id"], ["incidents.workspace_id", "incidents.project_id", "incidents.id"]),
         ForeignKeyConstraint(["origin_workspace_id", "origin_project_id", "source_incident_id", "source_evidence_id"], ["evidence_items.workspace_id", "evidence_items.project_id", "evidence_items.incident_id", "evidence_items.id"]),
         ForeignKeyConstraint(["origin_workspace_id", "origin_project_id", "source_document_id"], ["knowledge_documents.workspace_id", "knowledge_documents.project_id", "knowledge_documents.id"]),
+        ForeignKeyConstraint(["workspace_id", "project_id", "source_document_id", "source_chunk_id"],
+            ["document_chunks.workspace_id", "document_chunks.project_id", "document_chunks.document_id", "document_chunks.id"],
+            name="fk_context_document_chunk"),
         CheckConstraint("origin_workspace_id = workspace_id and origin_project_id = project_id", name="ck_context_same_project"),
         CheckConstraint("(source_kind='incident' and source_incident_id is not null and source_evidence_id is null and source_document_id is null) or (source_kind='evidence' and source_incident_id is not null and source_evidence_id is not null and source_document_id is null) or (source_kind='document' and source_incident_id is null and source_evidence_id is null and source_document_id is not null)", name="ck_context_source_kind"),
         UniqueConstraint("workspace_id", "project_id", "incident_id", "run_id", "id"),
@@ -481,7 +521,10 @@ class InvestigationRunContextReference(Base):
         Index("ix_context_run_rank", "run_id", "retrieval_rank"),
         Index("uq_context_incident_source", "run_id", "source_incident_id", unique=True, postgresql_where=(source_kind == "incident")),
         Index("uq_context_evidence_source", "run_id", "source_evidence_id", unique=True, postgresql_where=(source_kind == "evidence")),
-        Index("uq_context_document_source", "run_id", "source_document_id", unique=True, postgresql_where=(source_kind == "document")),
+        Index("uq_context_document_chunk_source", "run_id", "source_chunk_id", unique=True,
+              postgresql_where=((source_kind == "document") & source_chunk_id.is_not(None))),
+        Index("uq_context_document_legacy_source", "run_id", "source_document_id", unique=True,
+              postgresql_where=((source_kind == "document") & source_chunk_id.is_(None))),
     )
 
 
@@ -542,6 +585,7 @@ class Finding(Base):
     confidence_score: Mapped[float] = mapped_column(Float, nullable=False)
     confidence_method: Mapped[str] = mapped_column(String(80), default="evidence_heuristic")
     rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    details_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     review_status: Mapped[str] = mapped_column(String(24), default="pending")
     __table_args__ = (
         UniqueConstraint("run_id", "rank"),
@@ -596,6 +640,10 @@ class Recommendation(Base):
     finding_id: Mapped[object | None] = mapped_column(Uuid)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_benefit: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    evidence_refs: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    required_permissions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    verification_steps: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     risk_level: Mapped[str] = mapped_column(String(20), default="medium")
     status: Mapped[str] = mapped_column(String(24), default="proposed")
     __table_args__ = (
@@ -702,6 +750,91 @@ class IntegrationSyncRun(Base):
         ForeignKeyConstraint(["workspace_id", "project_id", "integration_id"], ["integrations.workspace_id", "integrations.project_id", "integrations.id"], ondelete="CASCADE"),
         ForeignKeyConstraint(["workspace_id", "project_id", "incident_id"], ["incidents.workspace_id", "incidents.project_id", "incidents.id"], ondelete="CASCADE", name="fk_sync_run_incident_scope"),
         Index("ix_integration_sync_history", "integration_id", "started_at"),
+    )
+
+
+class GitHubRepositoryMapping(Base):
+    __tablename__ = "github_repository_mappings"
+    id: Mapped[object] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    workspace_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    project_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    integration_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    service_id: Mapped[object | None] = mapped_column(Uuid)
+    repository_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    repository_full_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("integration_id", "repository_id", name="uq_github_integration_repository"),
+        ForeignKeyConstraint(["workspace_id", "project_id", "integration_id"], ["integrations.workspace_id", "integrations.project_id", "integrations.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["workspace_id", "project_id", "service_id"], ["services.workspace_id", "services.project_id", "services.id"], ondelete="CASCADE"),
+    )
+
+
+class GitHubDelivery(Base):
+    __tablename__ = "github_deliveries"
+    id: Mapped[object] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    workspace_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    project_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    integration_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    delivery_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    repository_id: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    repository_full_name: Mapped[str] = mapped_column(String(240), default="", nullable=False)
+    external_id: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    correlation_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="received", nullable=False)
+    __table_args__ = (
+        UniqueConstraint("integration_id", "delivery_id", name="uq_github_delivery"),
+        ForeignKeyConstraint(["workspace_id", "project_id", "integration_id"], ["integrations.workspace_id", "integrations.project_id", "integrations.id"], ondelete="CASCADE"),
+        CheckConstraint("status in ('received','unmapped','correlated','ignored')", name="ck_github_delivery_status"),
+        Index("ix_github_delivery_project_time", "project_id", "occurred_at"),
+    )
+
+
+class JiraProjectMapping(Base):
+    __tablename__ = "jira_project_mappings"
+    id: Mapped[object] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    workspace_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    project_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    integration_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    jira_project_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    jira_project_name: Mapped[str] = mapped_column(String(240), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("integration_id", name="uq_jira_mapping_per_integration"),
+        ForeignKeyConstraint(["workspace_id", "project_id", "integration_id"], ["integrations.workspace_id", "integrations.project_id", "integrations.id"], ondelete="CASCADE"),
+    )
+
+
+class ExternalIssueLink(Base):
+    __tablename__ = "external_issue_links"
+    id: Mapped[object] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    workspace_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    project_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    incident_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    recommendation_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    integration_id: Mapped[object] = mapped_column(Uuid, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    jira_project_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    external_issue_id: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    external_issue_key: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    external_issue_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    external_status: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
+    sync_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __table_args__ = (
+        UniqueConstraint("recommendation_id", "integration_id", name="uq_external_issue_recommendation_integration"),
+        UniqueConstraint("integration_id", "idempotency_key", name="uq_external_issue_idempotency"),
+        ForeignKeyConstraint(["workspace_id", "project_id", "incident_id"], ["incidents.workspace_id", "incidents.project_id", "incidents.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["workspace_id", "project_id", "recommendation_id"], ["recommendations.workspace_id", "recommendations.project_id", "recommendations.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["workspace_id", "project_id", "integration_id"], ["integrations.workspace_id", "integrations.project_id", "integrations.id"], ondelete="CASCADE"),
+        CheckConstraint("status in ('pending','created','failed')", name="ck_external_issue_link_status"),
     )
 
 

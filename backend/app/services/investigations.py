@@ -332,13 +332,26 @@ def _owns_lease(db: Session, run_id, worker_id: str) -> bool:
 
 
 def _persist_graph_result(db: Session, run: InvestigationRun, result: dict):
+    provider_metadata = result.get("provider_metadata") or {}
+    if provider_metadata:
+        run.provider_name = provider_metadata.get("provider", "unknown")[:40]
+        run.provider_mode = provider_metadata.get("mode", "unknown")[:24]
+        run.model_id = provider_metadata.get("model", run.model_id)[:120]
+        run.model_version = provider_metadata.get("model_version", "")[:160]
+        run.prompt_version = provider_metadata.get("prompt_version", run.prompt_version)[:40]
+        run.model_duration_ms = provider_metadata.get("duration_ms")
+        run.input_tokens = provider_metadata.get("input_tokens")
+        run.output_tokens = provider_metadata.get("output_tokens")
+        run.estimated_cost_usd = provider_metadata.get("estimated_cost_usd")
     for rank, item in enumerate(result.get("hypotheses", []), 1):
         finding = db.query(Finding).filter_by(run_id=run.id, rank=rank).one_or_none()
         if finding is None:
             finding = Finding(workspace_id=run.workspace_id, project_id=run.project_id,
                 incident_id=run.incident_id, run_id=run.id, rank=rank,
                 hypothesis=item["hypothesis"], confidence_score=item["confidence_score"],
-                confidence_method=item["confidence_method"], rationale=item["uncertainty"], review_status="pending")
+                confidence_method=item["confidence_method"], rationale=item["uncertainty"],
+                details_json={key: item.get(key) for key in ("explanation", "suspected_root_cause", "affected_service",
+                    "missing_evidence", "verification_steps", "risk_assessment")}, review_status="pending")
             db.add(finding)
             db.flush()
         else:
@@ -346,7 +359,9 @@ def _persist_graph_result(db: Session, run: InvestigationRun, result: dict):
             finding.confidence_score = item["confidence_score"]
             finding.confidence_method = item["confidence_method"]
             finding.rationale = item["uncertainty"]
-        for stance, citations in (("supports", item.get("support", [])), ("contradicts", item.get("contradict", [])), ("context", item.get("context", []))):
+            finding.details_json = {key: item.get(key) for key in ("explanation", "suspected_root_cause", "affected_service",
+                "missing_evidence", "verification_steps", "risk_assessment")}
+        for stance, citations in (("supports", item.get("support", [])), ("contradicts", item.get("contradict", []))):
             for citation in citations:
                 evidence_id = UUID(citation["id"])
                 exists = db.query(FindingEvidenceLink).filter_by(finding_id=finding.id, evidence_id=evidence_id, stance=stance).first()
@@ -355,7 +370,7 @@ def _persist_graph_result(db: Session, run: InvestigationRun, result: dict):
                     db.add(FindingEvidenceLink(workspace_id=run.workspace_id, project_id=run.project_id,
                         incident_id=run.incident_id, run_id=run.id, finding_id=finding.id,
                         evidence_id=evidence_id, stance=stance, explanation=citation.get("summary", "")))
-        for context_item in result.get("historical_context", []):
+        for context_item in item.get("context", []):
             context = db.get(InvestigationRunContextReference, UUID(context_item["id"]))
             if context and db.query(FindingContextLink).filter_by(
                 finding_id=finding.id, context_reference_id=context.id).one_or_none() is None:
@@ -369,7 +384,10 @@ def _persist_graph_result(db: Session, run: InvestigationRun, result: dict):
         if recommendation is None:
             db.add(Recommendation(workspace_id=run.workspace_id, project_id=run.project_id,
                 incident_id=run.incident_id, run_id=run.id, idempotency_key=key,
-                title=rec["title"], description=rec["description"], risk_level=rec["risk_level"], status="proposed"))
+                title=rec["title"], description=rec["description"], risk_level=rec["risk_level"],
+                expected_benefit=rec.get("benefit", ""), evidence_refs=rec.get("evidence_refs", []),
+                required_permissions=rec.get("required_permissions", []),
+                verification_steps=rec.get("verification_steps", []), status="proposed"))
 
 
 def execute_run(run_id: str, *, worker_id: str | None = None, celery_task_id: str = "",
@@ -439,8 +457,6 @@ def execute_run(run_id: str, *, worker_id: str | None = None, celery_task_id: st
                     InvestigationRunEvidence.run_id == run.id,
                     InvestigationRunEvidence.collection_status == "available").all()]
 
-        from app.services.retrieval import retrieve_context
-        _, context_rows = retrieve_context(db, run, incident, evidence)
         source_gaps = [{"source": row.source_type, "status": row.status, "reason": row.reason}
             for row in db.query(InvestigationRunSourceStatus).filter_by(run_id=run.id).all()
             if row.status in ("unavailable", "failed", "skipped")]
@@ -449,8 +465,28 @@ def execute_run(run_id: str, *, worker_id: str | None = None, celery_task_id: st
             "incident": {"id": str(incident.id), "title": incident.title, "description": incident.description},
             "evidence": [{"id": str(x.id), "summary": x.summary, "source_type": x.source_type,
                           "observed_at": x.observed_at.isoformat()} for x in evidence],
-            "source_gaps": source_gaps, "historical": context_rows,
+            "source_gaps": source_gaps, "historical": [],
         }
+
+        def retrieve_for_run(_state):
+            from app.services.retrieval import retrieve_context
+            _, context_rows, document_status = retrieve_context(db, run, incident, evidence)
+            source_type = "knowledge_retrieval"
+            source_ref = settings.embedding_provider if document_status["status"] == "completed" else "embedding-provider"
+            fingerprint = sha256(f"{run.id}:knowledge:{run.project_id}".encode()).hexdigest()
+            attempt_no = (db.query(func.max(InvestigationRunSourceStatus.attempt_no)).filter_by(
+                run_id=run.id, source_type=source_type, source_instance_ref=source_ref,
+                query_fingerprint=fingerprint).scalar() or 0) + 1
+            db.add(InvestigationRunSourceStatus(workspace_id=run.workspace_id, project_id=run.project_id,
+                incident_id=run.incident_id, run_id=run.id, source_type=source_type,
+                source_instance_ref=source_ref, query_fingerprint=fingerprint, attempt_no=attempt_no,
+                status=document_status["status"], result_count=document_status.get("result_count", 0),
+                reason=document_status["reason"]))
+            db.commit()
+            gaps = [{"source": row.source_type, "status": row.status, "reason": row.reason}
+                for row in db.query(InvestigationRunSourceStatus).filter_by(run_id=run.id).all()
+                if row.status in ("unavailable", "failed", "skipped")]
+            return {"historical": context_rows, "source_gaps": gaps}
 
         def progress(key, status, output=None, error=""):
             if not _owns_lease(db, run.id, worker_id):
@@ -473,7 +509,8 @@ def execute_run(run_id: str, *, worker_id: str | None = None, celery_task_id: st
         with checkpoint_context as active_checkpointer:
             if hasattr(active_checkpointer, "setup"):
                 active_checkpointer.setup()
-            graph = build_graph(checkpointer=active_checkpointer, on_step=progress)
+            graph = build_graph(checkpointer=active_checkpointer, on_step=progress,
+                                retrieve_fn=retrieve_for_run)
             snapshot = graph.get_state(config)
             if snapshot.values and snapshot.next:
                 graph_result = graph.invoke(None, config)

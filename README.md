@@ -2,7 +2,7 @@
 
 IncidentIQ is a final-year project prototype for incident investigation and issue management. The MVP combines a FastAPI API, a React interface, PostgreSQL with pgvector, Celery/Redis background work, a resumable LangGraph workflow, run-specific evidence citations, historical context references, and human-approved simulated remediation.
 
-The default investigation provider is deterministic demo logic. It makes no accuracy claims. An optional OpenAI chat-completions provider can be selected with server-side environment settings; it is never required for the demo. Findings show a heuristic ranking score, not a calibrated probability.
+The platform supports an explicit deterministic mock investigation provider for offline demonstrations and a strict OpenAI provider for evidence-grounded analysis. Provider failures are surfaced; they never silently fall back to demo output. Semantic historical retrieval requires the OpenAI embeddings provider and PostgreSQL pgvector. Findings show a transparent heuristic ranking score, not a calibrated probability.
 
 ## Local environment
 
@@ -30,9 +30,11 @@ Migrations are a manual deployment operation. Before applying one, create and ve
 
 Do not include this command in ordinary API restarts or deployments. The API, worker, and dispatcher must not run migrations automatically.
 
-### Optional hosted LLM
+### AI providers and knowledge documents
 
-Set LLM_PROVIDER=openai and OPENAI_API_KEY in the untracked root .env. The key stays in the backend environment. If the provider is unset, the application uses its deterministic mock provider. Do not place provider credentials in frontend variables.
+For real investigations, set `LLM_PROVIDER=openai` and `OPENAI_API_KEY` in the untracked root `.env`; the key is passed only to backend containers. Missing keys and provider errors are reported as unavailable rather than returning mock findings. Set `EMBEDDING_PROVIDER=openai` to enable semantic retrieval and document indexing; this uses `OPENAI_API_KEY` and the configured `OPENAI_EMBEDDING_MODEL`. The default `disabled` mode does not invent embeddings. Existing documents require re-indexing after migration 0008.
+
+The Knowledge page accepts UTF-8 text, Markdown, CSV and JSON documents, applies a configured size limit, and reports indexing status. Documents and retrieved chunks are project-scoped; each historical reference retains its document version, chunk and timestamp. GitHub repository mappings use signed webhook deliveries to record deployment/change evidence. Jira task creation requires an approved recommendation. See [Phase 3 AI and engineering integrations](docs/phase3-ai.md) for setup, API behavior and limitations.
 
 ## Tests
 
@@ -57,12 +59,13 @@ The browser workflow is in frontend/e2e. With the app stack running, install the
 - backend/migrations contains Alembic schema history. Review model changes and generate/review a migration before applying it.
 - backend/app/services/investigations.py persists run steps and attempts, collects run-specific evidence, and stores findings/recommendations.
 - backend/app/ai.py defines the LangGraph workflow. PostgreSQL checkpoints use the stable investigation thread ID.
-- backend/app/services/retrieval.py filters historical retrieval to the same project and stores provenance references. Its current 64-dimensional feature-hash vector is a deterministic retrieval demonstration, not a pretrained semantic embedding model.
+- backend/app/ai_providers.py validates structured provider output and records model/runtime metadata; mock and real modes are explicit.
+- backend/app/services/embeddings.py creates real OpenAI embeddings when enabled. backend/app/services/retrieval.py performs project-scoped pgvector retrieval and persists source provenance; it has no feature-hash fallback.
 - backend/app/services/outbox.py publishes committed events to Celery. The queue contains IDs; PostgreSQL remains the source of truth.
 - Large uploaded text artifacts are stored under the configured artifact directory. PostgreSQL holds their scoped metadata, hash and storage reference.
 
 ## MVP boundaries
 
-The seeded demo supplies repeatable incident evidence and one historical case. The optional Phase 2 observability profile provides live Prometheus, Alertmanager, Loki, Tempo and OpenTelemetry telemetry flows for the synthetic Payment API. See [the Phase 2 observability guide](docs/phase2-observability.md). External provider availability and production suitability still depend on deployment-specific network, security and retention configuration. The simulated remediation executor records that no production system changed.
+The seeded demo supplies repeatable incident evidence and a pending runbook document; it is not represented as embedded until a real embedding provider indexes it. The optional Phase 2 observability profile provides live Prometheus, Alertmanager, Loki, Tempo and OpenTelemetry telemetry flows for the synthetic Payment API. See [the Phase 2 observability guide](docs/phase2-observability.md). External provider availability and production suitability still depend on deployment-specific network, security and retention configuration. The simulated remediation executor records that no production system changed.
 
 The research direction is evidence-grounded and uncertainty-aware diagnosis. No research results or novelty claims are included; evaluate against a fixed held-out scenario set before reporting results.

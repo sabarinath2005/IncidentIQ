@@ -31,8 +31,8 @@ Alembic is the schema history. Revision `0002_investigation_reliability` adds ru
 
 API startup, worker startup, and dispatcher startup do not apply migrations. Migrations are explicit deployment operations. Before applying one, create and verify a restorable backup of the target database and obtain explicit approval from the responsible maintainer. From the repository root, the approved command is `docker compose run --rm api alembic upgrade head`. Never add it to ordinary service startup or deployment commands.
 
-Phase 2 adds Alertmanager alert deduplication and provider provenance in `0005_observability_alerts`; review the detailed observability profile and its explicit migration prerequisite in [phase2-observability.md](phase2-observability.md). Provider evidence is collected through bounded Celery tasks and remains scoped to the incident project.
+Phase 2 adds Alertmanager alert deduplication and provider provenance in `0005_observability_alerts`; review [phase2-observability.md](phase2-observability.md). Phase 3 adds explicit system identity and AI provider metadata in `0006`/`0007`, real embedding storage and document provenance in `0008`, and GitHub/Jira mapping and deployment records in `0009`. Verify these migrations on disposable PostgreSQL before deployment. Provider evidence is collected through bounded Celery tasks and remains scoped to the incident project.
 
 ## Research boundary
 
-The mock provider is deterministic and suitable for product-flow testing, not for measuring model quality. The feature-hash vector is a small reproducible retrieval mechanism and is not represented as pretrained semantic embedding. Evaluate against keyword/no-retrieval baselines and held-out labeled scenarios before making claims.
+The mock provider is deterministic and suitable for product-flow testing, not for measuring model quality. Semantic retrieval uses configured real embeddings; when embeddings are disabled, retrieval reports that it is unavailable rather than manufacturing vectors. Evaluate against keyword/no-retrieval baselines and held-out labeled scenarios before making claims.

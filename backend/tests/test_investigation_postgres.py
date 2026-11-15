@@ -12,7 +12,7 @@ from app.models import (
     EvidenceItem, Finding, FindingEvidenceLink, Incident, InvestigationRun,
     InvestigationRunAttempt, InvestigationRunEvidence, InvestigationStep,
     InvestigationStepAttempt, OutboxEvent, Project, ProjectMember, User,
-    Workspace, WorkspaceMember, Recommendation,
+    Workspace, WorkspaceMember, Recommendation, KnowledgeDocument, DocumentChunk,
 )
 from app.services.investigations import _persist_graph_result, _step, claim_run, execute_run, record_execution_failure
 from app.run_lifecycle import transition_run
@@ -145,6 +145,61 @@ def test_concurrent_run_creation_returns_one_active_run_and_one_outbox(pg_sessio
         assert check.query(OutboxEvent).filter(OutboxEvent.event_type == "investigation.requested").count() == 1
     finally:
         check.close()
+
+
+def test_pgvector_retrieval_is_project_scoped_and_persists_chunk_provenance(pg_session_factory, monkeypatch):
+    import app.services.retrieval as retrieval
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "embedding_provider", "openai")
+    query_vector = [1.0] + [0.0] * 1535
+    monkeypatch.setattr(retrieval, "embed_texts", lambda values: ([query_vector], settings.openai_embedding_model))
+    session = pg_session_factory()
+    try:
+        workspace, project, user = make_project(session)
+        incident = make_incident(session, workspace, project, user, "Checkout timeout")
+        run = make_run(session, incident, user, status="running")
+        doc = KnowledgeDocument(workspace_id=workspace.id, project_id=project.id,
+            title="Checkout runbook", source_kind="runbook", content_hash="b" * 64,
+            content="Inspect connection pool saturation.", status="indexed", version=3)
+        session.add(doc)
+        session.flush()
+        chunks = [DocumentChunk(workspace_id=workspace.id, project_id=project.id,
+            document_id=doc.id, chunk_index=index, text=text,
+            embedding=[0.1] * 64, embedding_model="demo-hash-v1",
+            embedding_1536=query_vector, embedding_1536_model="text-embedding-3-small",
+            embedding_1536_dimensions=1536)
+            for index, text in ((2, "Inspect connection pool saturation."), (3, "Compare checkout timeout thresholds."))]
+        session.add_all(chunks)
+
+        other_workspace, other_project, other_user = make_project(session)
+        other_incident = make_incident(session, other_workspace, other_project, other_user, "Checkout timeout")
+        other_doc = KnowledgeDocument(workspace_id=other_workspace.id, project_id=other_project.id,
+            title="Other project runbook", source_kind="runbook", content_hash="c" * 64,
+            content="Private source text.", status="indexed")
+        session.add(other_doc)
+        session.flush()
+        session.add(DocumentChunk(workspace_id=other_workspace.id, project_id=other_project.id,
+            document_id=other_doc.id, chunk_index=0, text="Private source text.",
+            embedding=[0.1] * 64, embedding_model="demo-hash-v1",
+            embedding_1536=query_vector, embedding_1536_model="text-embedding-3-small",
+            embedding_1536_dimensions=1536))
+        session.flush()
+
+        _, contexts, status = retrieval.retrieve_context(session, run, incident, [])
+        assert status["status"] == "completed" and status["result_count"] == 2
+        assert len(contexts) == 2
+        assert {item["source_document_id"] for item in contexts} == {str(doc.id)}
+        assert {item["source_chunk_id"] for item in contexts} == {str(chunk.id) for chunk in chunks}
+        assert {item["version"] for item in contexts} == {3}
+        references = session.query(main.InvestigationRunContextReference).filter_by(run_id=run.id).all()
+        assert len(references) == 2
+        assert all(reference.origin_workspace_id == workspace.id for reference in references)
+        assert {reference.source_document_version for reference in references} == {3}
+        assert {reference.source_chunk_index for reference in references} == {2, 3}
+        assert all(reference.source_excerpt and reference.source_timestamp for reference in references)
+    finally:
+        session.close()
 
 
 def test_concurrent_claim_and_duplicate_delivery_are_safe(pg_session_factory):

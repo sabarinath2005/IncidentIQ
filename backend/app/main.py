@@ -8,7 +8,7 @@ import shutil
 import hmac
 import re
 from urllib.parse import urlsplit
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, Header
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import or_, func
@@ -22,6 +22,7 @@ from app.schemas import *
 from app.run_lifecycle import InvalidRunTransition, RUN_ACTIVE_STATUSES, transition_run
 from app.services.credentials import encrypt_credentials, masked_credentials_present
 from app.services.connectors import ConnectionResult, registry as connector_registry
+from app.ai_providers import provider_mode, provider_status
 
 ACTIVE_RUNS = RUN_ACTIVE_STATUSES
 ALLOWED_ISSUE_TRANSITIONS = {
@@ -36,6 +37,12 @@ def iso(row):
     for key, value in data.items():
         if isinstance(value, UUID):
             data[key] = str(value)
+    return data
+
+
+def knowledge_out(row):
+    data = iso(row)
+    data.pop("content", None)
     return data
 
 
@@ -82,6 +89,12 @@ configure_telemetry(app, settings.otlp_endpoint)
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "incident-platform"}
+
+
+@app.get("/api/v1/ai/provider")
+def ai_provider_status(user: User = Depends(current_user)):
+    """Expose safe runtime status only; never return provider URLs or credentials."""
+    return provider_status()
 
 
 @app.post("/api/v1/auth/register", status_code=201)
@@ -487,12 +500,23 @@ def test_integration(integration_id: UUID, user: User = Depends(current_user), d
     require_role(str(row.project_id), user, db, {"admin"})
     connector = connector_registry.get(row.provider)
     if not connector: raise HTTPException(422, "Provider has no registered connector")
-    errors = connector.validate_config(row.config)
-    try:
-        result = connector.test_connection(row.config, connector_registry.credentials_for(row))
-    except ValueError:
+    test_config = dict(row.config or {})
+    if row.provider == "github":
+        repositories = db.query(GitHubRepositoryMapping.repository_full_name).filter_by(
+            workspace_id=row.workspace_id, project_id=row.project_id, integration_id=row.id,
+        ).order_by(GitHubRepositoryMapping.repository_full_name).limit(
+            connector.max_repositories_per_test + 1).all()
+        test_config["repositories"] = [repository for (repository,) in repositories]
+    errors = connector.validate_config(test_config)
+    if errors:
         from app.services.connectors import ConnectorTest
-        result = ConnectorTest(ConnectionResult.UNAVAILABLE, "credential_decryption_failed", "Stored credentials could not be authenticated.")
+        result = ConnectorTest(ConnectionResult.INVALID_CONFIGURATION, "invalid_configuration", "; ".join(errors))
+    else:
+        try:
+            result = connector.test_connection(test_config, connector_registry.credentials_for(row))
+        except ValueError:
+            from app.services.connectors import ConnectorTest
+            result = ConnectorTest(ConnectionResult.UNAVAILABLE, "credential_decryption_failed", "Stored credentials could not be authenticated.")
     row.last_checked_at = datetime.now(timezone.utc)
     row.last_test_result = result.result.value.lower()
     row.health_status = ("healthy" if result.result == ConnectionResult.CONNECTED else
@@ -520,6 +544,383 @@ def integration_sync_history(integration_id: UUID, limit: int = Query(50, ge=1, 
     runs = db.query(IntegrationSyncRun).filter_by(workspace_id=row.workspace_id,
         project_id=row.project_id, integration_id=row.id).order_by(IntegrationSyncRun.started_at.desc()).limit(limit).all()
     return [iso(run) for run in runs]
+
+
+@app.get("/api/v1/projects/{project_id}/knowledge-documents")
+def list_knowledge_documents(project_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    return [knowledge_out(row) for row in db.query(KnowledgeDocument).filter_by(
+        workspace_id=project.workspace_id, project_id=project.id).filter(
+            KnowledgeDocument.status != "removed").order_by(KnowledgeDocument.created_at.desc()).all()]
+
+
+@app.post("/api/v1/projects/{project_id}/knowledge-documents", status_code=201)
+async def upload_knowledge_document(project_id: UUID, file: UploadFile = File(...),
+        source_kind: str = Form("runbook"), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    require_role(str(project.id), user, db, {"admin", "member"})
+    allowed_kinds = {"runbook", "troubleshooting_guide", "architecture", "procedure", "incident_summary"}
+    if source_kind not in allowed_kinds:
+        raise HTTPException(422, "Unsupported knowledge document type")
+    content = await file.read(settings.knowledge_max_file_bytes + 1)
+    if len(content) > settings.knowledge_max_file_bytes:
+        raise HTTPException(413, "Document exceeds the configured size limit")
+    from app.services.knowledge import content_digest, parse_document, process_document
+    try:
+        filename, mime_type, text_content = parse_document(file.filename or "", file.content_type or "", content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    digest = content_digest(text_content)
+    existing = db.query(KnowledgeDocument).filter_by(workspace_id=project.workspace_id,
+        project_id=project.id, content_hash=digest).filter(KnowledgeDocument.status != "removed").one_or_none()
+    if existing:
+        return {**knowledge_out(existing), "deduplicated": True}
+    row = KnowledgeDocument(workspace_id=project.workspace_id, project_id=project.id,
+        title=filename.rsplit(".", 1)[0][:240], filename=filename, mime_type=mime_type,
+        file_size=len(content), source_ref=filename, source_kind=source_kind,
+        content_hash=digest, content=text_content, status="pending")
+    db.add(row)
+    db.flush()
+    audit(db, project.workspace_id, user.id, "knowledge_document.uploaded", "knowledge_document", row.id,
+          {"source_kind": source_kind, "content_hash": digest, "size": len(content)}, project.id)
+    db.commit()
+    db.refresh(row)
+    return knowledge_out(process_document(db, row))
+
+
+@app.put("/api/v1/knowledge-documents/{document_id}")
+def update_knowledge_document(document_id: UUID, payload: KnowledgeDocumentUpdate,
+        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = db.get(KnowledgeDocument, document_id)
+    if row is None or row.status == "removed":
+        raise HTTPException(404, "Knowledge document not found")
+    require_role(str(row.project_id), user, db, {"admin"})
+    values = payload.model_dump(exclude_unset=True)
+    text_changed = "content" in values and values["content"] != row.content
+    if text_changed:
+        if len(values["content"].encode("utf-8")) > settings.knowledge_max_file_bytes:
+            raise HTTPException(413, "Document exceeds the configured size limit")
+        from app.services.knowledge import content_digest
+        digest = content_digest(values["content"])
+        duplicate = db.query(KnowledgeDocument).filter(KnowledgeDocument.project_id == row.project_id,
+            KnowledgeDocument.id != row.id, KnowledgeDocument.content_hash == digest,
+            KnowledgeDocument.status != "removed").first()
+        if duplicate:
+            raise HTTPException(409, "Identical document content already exists in this project")
+        row.content = values.pop("content")
+        row.content_hash = digest
+        row.file_size = len(row.content.encode("utf-8"))
+        row.version += 1
+        row.status = "pending"
+        row.chunk_count = 0
+        row.indexed_at = None
+    for key, value in values.items():
+        setattr(row, key, value)
+    audit(db, row.workspace_id, user.id, "knowledge_document.updated", "knowledge_document", row.id,
+          {"version": row.version, "content_changed": text_changed}, row.project_id)
+    db.commit()
+    db.refresh(row)
+    if text_changed:
+        from app.services.knowledge import process_document
+        row = process_document(db, row)
+    return knowledge_out(row)
+
+
+@app.get("/api/v1/knowledge-documents/{document_id}")
+def get_knowledge_document(document_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = db.get(KnowledgeDocument, document_id)
+    if row is None or row.status == "removed":
+        raise HTTPException(404, "Knowledge document not found")
+    project_or_404(db, row.project_id, user)
+    return iso(row)
+
+
+@app.post("/api/v1/knowledge-documents/{document_id}/retry")
+def retry_knowledge_document(document_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = db.get(KnowledgeDocument, document_id)
+    if row is None or row.status == "removed":
+        raise HTTPException(404, "Knowledge document not found")
+    require_role(str(row.project_id), user, db, {"admin", "member"})
+    if row.status != "failed":
+        raise HTTPException(409, "Only failed document indexing can be retried")
+    audit(db, row.workspace_id, user.id, "knowledge_document.retry_requested", "knowledge_document", row.id,
+          {"version": row.version}, row.project_id)
+    db.commit()
+    from app.services.knowledge import process_document
+    return knowledge_out(process_document(db, row))
+
+
+@app.delete("/api/v1/knowledge-documents/{document_id}", status_code=204)
+def delete_knowledge_document(document_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = db.get(KnowledgeDocument, document_id)
+    if row is None or row.status == "removed":
+        raise HTTPException(404, "Knowledge document not found")
+    require_role(str(row.project_id), user, db, {"admin"})
+    audit(db, row.workspace_id, user.id, "knowledge_document.deleted", "knowledge_document", row.id,
+          {"content_hash": row.content_hash, "version": row.version}, row.project_id)
+    has_context_refs = db.query(InvestigationRunContextReference).filter_by(
+        source_document_id=row.id).first() is not None
+    if has_context_refs:
+        row.status = "removed"
+        row.processing_error = "Removed from active retrieval; retained for investigation provenance."
+    else:
+        db.delete(row)
+    db.commit()
+    return None
+
+
+@app.get("/api/v1/projects/{project_id}/github/repositories")
+def list_github_repositories(project_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    return [iso(row) for row in db.query(GitHubRepositoryMapping).filter_by(
+        workspace_id=project.workspace_id, project_id=project.id).order_by(GitHubRepositoryMapping.repository_full_name).all()]
+
+
+@app.post("/api/v1/integrations/{integration_id}/github/repositories", status_code=201)
+def map_github_repository(integration_id: UUID, payload: GitHubRepositoryMappingCreate,
+        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    integration = db.get(Integration, integration_id)
+    if not integration or integration.provider != "github":
+        raise HTTPException(404, "GitHub integration not found")
+    project = project_or_404(db, integration.project_id, user)
+    require_role(str(project.id), user, db, {"admin"})
+    if payload.service_id:
+        service = db.query(Service).filter_by(workspace_id=project.workspace_id, project_id=project.id,
+            id=payload.service_id).one_or_none()
+        if service is None:
+            raise HTTPException(404, "Project service not found")
+    row = db.query(GitHubRepositoryMapping).filter_by(integration_id=integration.id,
+        repository_id=payload.repository_id).one_or_none()
+    if row is None:
+        row = GitHubRepositoryMapping(workspace_id=project.workspace_id, project_id=project.id,
+            integration_id=integration.id, repository_id=payload.repository_id,
+            repository_full_name=payload.repository_full_name, service_id=payload.service_id)
+        db.add(row)
+    else:
+        row.repository_full_name = payload.repository_full_name
+        row.service_id = payload.service_id
+    audit(db, project.workspace_id, user.id, "github.repository_mapped", "github_repository_mapping", row.id,
+          {"repository": payload.repository_full_name, "service_id": str(payload.service_id) if payload.service_id else None}, project.id)
+    db.commit()
+    db.refresh(row)
+    return iso(row)
+
+
+@app.delete("/api/v1/github/repositories/{mapping_id}", status_code=204)
+def delete_github_repository_mapping(mapping_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = db.get(GitHubRepositoryMapping, mapping_id)
+    if row is None:
+        raise HTTPException(404, "Repository mapping not found")
+    project_or_404(db, row.project_id, user)
+    require_role(str(row.project_id), user, db, {"admin"})
+    audit(db, row.workspace_id, user.id, "github.repository_unmapped", "github_repository_mapping", row.id,
+          {"repository": row.repository_full_name}, row.project_id)
+    db.delete(row)
+    db.commit()
+    return None
+
+
+@app.get("/api/v1/projects/{project_id}/github/events")
+def github_events(project_id: UUID, limit: int = Query(50, ge=1, le=200),
+        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    return [iso(row) for row in db.query(GitHubDelivery).filter_by(
+        workspace_id=project.workspace_id, project_id=project.id).order_by(
+            GitHubDelivery.received_at.desc()).limit(limit).all()]
+
+
+@app.post("/api/v1/webhooks/github/{integration_id}", status_code=202)
+async def github_webhook(integration_id: UUID, request: Request,
+        delivery_id: str | None = Header(default=None, alias="X-GitHub-Delivery"),
+        event_type: str | None = Header(default=None, alias="X-GitHub-Event"),
+        signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+        db: Session = Depends(get_db)):
+    integration = db.get(Integration, integration_id)
+    if not integration or integration.provider != "github" or not integration.enabled:
+        raise HTTPException(404, "GitHub integration not found or disabled")
+    if not delivery_id or len(delivery_id) > 200 or not event_type or len(event_type) > 40:
+        raise HTTPException(400, "GitHub delivery headers are missing or invalid")
+    length = request.headers.get("content-length")
+    if length and (not length.isdigit() or int(length) > 1_000_000):
+        raise HTTPException(413, "GitHub payload exceeds the webhook size limit")
+    body = await request.body()
+    if len(body) > 1_000_000:
+        raise HTTPException(413, "GitHub payload exceeds the webhook size limit")
+    from app.services.github import ingest_delivery, valid_signature
+    try:
+        credentials = connector_registry.credentials_for(integration)
+    except Exception:
+        raise HTTPException(503, "GitHub webhook credentials are unavailable")
+    secret = credentials.get("webhook_secret") if isinstance(credentials, dict) else None
+    if not valid_signature(body, signature, secret):
+        raise HTTPException(401, "GitHub webhook signature is invalid")
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        row, deduplicated = ingest_delivery(db, integration, delivery_id, event_type, payload)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, "GitHub webhook payload is invalid") from exc
+    except IntegrityError:
+        db.rollback()
+        row = db.query(GitHubDelivery).filter_by(integration_id=integration.id, delivery_id=delivery_id).one_or_none()
+        if row is None:
+            raise HTTPException(409, "GitHub delivery could not be recorded")
+        deduplicated = True
+    audit(db, integration.workspace_id, None, "github.webhook_received", "github_delivery", row.id,
+          {"event_type": event_type, "deduplicated": deduplicated, "status": row.status}, integration.project_id)
+    db.commit()
+    return {"accepted": True, "deduplicated": deduplicated, "status": row.status}
+
+
+@app.get("/api/v1/projects/{project_id}/jira/project-mapping")
+def get_jira_mapping(project_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    row = db.query(JiraProjectMapping).filter_by(workspace_id=project.workspace_id, project_id=project.id).one_or_none()
+    return iso(row) if row else None
+
+
+@app.get("/api/v1/projects/{project_id}/jira/issues")
+def list_jira_issues(project_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    return [iso(row) for row in db.query(ExternalIssueLink).join(Integration,
+        Integration.id == ExternalIssueLink.integration_id).filter(
+            ExternalIssueLink.workspace_id == project.workspace_id,
+            ExternalIssueLink.project_id == project.id, Integration.provider == "jira")
+        .order_by(ExternalIssueLink.updated_at.desc()).limit(200).all()]
+
+
+@app.put("/api/v1/integrations/{integration_id}/jira/project-mapping")
+def put_jira_mapping(integration_id: UUID, payload: JiraProjectMappingCreate,
+        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    integration = db.get(Integration, integration_id)
+    if not integration or integration.provider != "jira":
+        raise HTTPException(404, "Jira integration not found")
+    project = project_or_404(db, integration.project_id, user)
+    require_role(str(project.id), user, db, {"admin"})
+    row = db.query(JiraProjectMapping).filter_by(integration_id=integration.id).one_or_none()
+    if row is None:
+        row = JiraProjectMapping(workspace_id=project.workspace_id, project_id=project.id,
+            integration_id=integration.id, jira_project_key=payload.jira_project_key,
+            jira_project_name=payload.jira_project_name)
+        db.add(row)
+    else:
+        row.jira_project_key = payload.jira_project_key
+        row.jira_project_name = payload.jira_project_name
+    audit(db, project.workspace_id, user.id, "jira.project_mapped", "jira_project_mapping", row.id,
+          {"jira_project_key": row.jira_project_key}, project.id)
+    db.commit()
+    db.refresh(row)
+    return iso(row)
+
+
+@app.post("/api/v1/recommendations/{recommendation_id}/jira-issue")
+def create_jira_issue(recommendation_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    recommendation = db.get(Recommendation, recommendation_id)
+    if recommendation is None:
+        raise HTTPException(404, "Recommendation not found")
+    project = project_or_404(db, recommendation.project_id, user)
+    require_role(str(project.id), user, db, {"admin"})
+    approved = db.query(ApprovalRequest).filter_by(workspace_id=project.workspace_id,
+        project_id=project.id, recommendation_id=recommendation.id, status="approved").first()
+    if approved is None:
+        raise HTTPException(409, "A human-approved recommendation is required before Jira issue creation")
+    integration = db.query(Integration).filter_by(project_id=project.id, provider="jira", enabled=True).one_or_none()
+    if integration is None:
+        raise HTTPException(409, "An enabled Jira integration is required")
+    mapping = db.query(JiraProjectMapping).filter_by(integration_id=integration.id).one_or_none()
+    if mapping is None:
+        raise HTTPException(409, "Map this IncidentIQ project to a Jira project first")
+    link = db.query(ExternalIssueLink).filter_by(recommendation_id=recommendation.id,
+        integration_id=integration.id).one_or_none()
+    if link is None:
+        idempotency = sha256(f"jira:{integration.id}:{recommendation.id}".encode()).hexdigest()
+        link = ExternalIssueLink(workspace_id=project.workspace_id, project_id=project.id,
+            incident_id=recommendation.incident_id, recommendation_id=recommendation.id,
+            integration_id=integration.id, idempotency_key=idempotency,
+            jira_project_key=mapping.jira_project_key, status="pending")
+        db.add(link)
+        db.flush()
+    if link.status == "created":
+        return iso(link)
+    link.status = "pending"
+    link.sync_error = ""
+    db.commit()
+    marker = "IIQ" + link.idempotency_key[:32].upper()
+    try:
+        from app.services.jira import (JiraAdapter, JiraProviderError, build_incident_description,
+                                       incident_url_for_origin, jira_priority_for_risk)
+        credentials = connector_registry.credentials_for(integration)
+        adapter = JiraAdapter(integration.config.get("base_url", ""), credentials.get("email", ""),
+                              credentials.get("api_token", ""))
+        incident = db.query(Incident).filter_by(workspace_id=project.workspace_id,
+            project_id=project.id, id=recommendation.incident_id).one_or_none()
+        if incident is None:
+            raise JiraProviderError("The recommendation's IncidentIQ incident is unavailable")
+        incident_url = incident_url_for_origin(settings.frontend_origin, str(incident.id))
+        investigation = db.get(InvestigationRun, recommendation.run_id) if recommendation.run_id else None
+        investigation_context = ""
+        if investigation is not None:
+            investigation_context = (f"Run ID: {investigation.id}; provider: "
+                f"{investigation.provider_name or 'unknown'}; model: {investigation.model_id or 'unknown'}; "
+                f"status: {investigation.status}")
+        issue_description = build_incident_description(
+            incident_id=incident.id, incident_title=incident.title, incident_url=incident_url,
+            recommendation_description=recommendation.description,
+            expected_benefit=recommendation.expected_benefit,
+            required_permissions=recommendation.required_permissions,
+            verification_steps=recommendation.verification_steps,
+            evidence_refs=recommendation.evidence_refs,
+            investigation_context=investigation_context,
+        )
+        result = adapter.create_or_reconcile(project_key=mapping.jira_project_key,
+            summary=recommendation.title, description=issue_description, marker=marker,
+            priority=jira_priority_for_risk(recommendation.risk_level))
+        link.external_issue_id = str(result["id"])[:80]
+        link.external_issue_key = str(result["key"])[:80]
+        link.external_issue_url = adapter.base_url + "/browse/" + link.external_issue_key
+        link.external_status = str((result.get("fields") or {}).get("status", {}).get("name", ""))[:80]
+        link.status = "created"
+        link.sync_error = ""
+        audit(db, project.workspace_id, user.id, "jira.issue_created", "external_issue_link", link.id,
+              {"issue_key": link.external_issue_key, "recommendation_id": str(recommendation.id)}, project.id)
+    except Exception as exc:
+        link.status = "failed"
+        link.sync_error = str(exc)[:500] if exc.__class__.__name__ == "JiraProviderError" else "Jira issue creation failed; retry to reconcile its idempotency marker."
+        audit(db, project.workspace_id, user.id, "jira.issue_creation_failed", "external_issue_link", link.id,
+              {"error_type": type(exc).__name__}, project.id)
+        db.commit()
+        raise HTTPException(502, link.sync_error)
+    db.commit()
+    db.refresh(link)
+    return iso(link)
+
+
+@app.post("/api/v1/external-issue-links/{link_id}/sync")
+def sync_jira_issue(link_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    link = db.get(ExternalIssueLink, link_id)
+    if link is None:
+        raise HTTPException(404, "External issue link not found")
+    project_or_404(db, link.project_id, user)
+    require_role(str(link.project_id), user, db, {"admin"})
+    integration = db.get(Integration, link.integration_id)
+    if integration is None or not link.external_issue_key:
+        raise HTTPException(409, "Jira issue is not linked")
+    try:
+        credentials = connector_registry.credentials_for(integration)
+        from app.services.jira import JiraAdapter
+        adapter = JiraAdapter(integration.config.get("base_url", ""), credentials.get("email", ""),
+                              credentials.get("api_token", ""))
+        link.external_status = adapter.issue_status(link.external_issue_key)
+        link.last_synced_at = datetime.now(timezone.utc)
+        link.sync_error = ""
+        audit(db, link.workspace_id, user.id, "jira.issue_status_synced", "external_issue_link", link.id,
+              {"external_status": link.external_status}, link.project_id)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(502, "Jira status synchronization failed") from exc
+    return iso(link)
 
 
 @app.post("/api/v1/webhooks/alertmanager/{integration_id}")
@@ -888,10 +1289,14 @@ def start_investigation(incident_id: UUID, idempotency_key: str = Query(..., min
         InvestigationRun.status.in_(ACTIVE_RUNS)).one_or_none()
     if active:
         return {**iso(active), "deduplicated": True}
+    provider_name, provider_state, model_name = provider_mode()
+    if provider_state == "unavailable":
+        raise HTTPException(503, "The configured AI provider is unavailable or missing required configuration")
     run = InvestigationRun(workspace_id=incident.workspace_id, project_id=incident.project_id,
         incident_id=incident.id, requested_by=user.id, idempotency_key=idempotency_key,
         thread_id=f"investigation-{uuid4()}", status="queued",
-        model_id=settings.openai_model if settings.llm_provider == "openai" and settings.openai_api_key else "mock-demo")
+        model_id=model_name or "unavailable", provider_name=provider_name, provider_mode=provider_state,
+        model_version=model_name or "", prompt_version="incident-analysis-v1" if provider_name == "openai" else "demo-rules-v1")
     db.add(run)
     try:
         db.flush()
@@ -1004,7 +1409,9 @@ def recommendations(incident_id: UUID, user: User = Depends(current_user), db: S
     result = []
     for row in rows:
         approvals = db.query(ApprovalRequest).filter_by(recommendation_id=row.id).all()
-        result.append({**iso(row), "approvals": [iso(x) for x in approvals]})
+        external_links = db.query(ExternalIssueLink).filter_by(recommendation_id=row.id).all()
+        result.append({**iso(row), "approvals": [iso(x) for x in approvals],
+                       "external_issue_links": [iso(x) for x in external_links]})
     return result
 
 
@@ -1014,7 +1421,10 @@ def create_approval(recommendation_id: UUID, user: User = Depends(current_user),
     if not rec: raise HTTPException(404, "Recommendation not found")
     project_or_404(db, rec.project_id, user)
     require_role(str(rec.project_id), user, db, {"admin", "member"})
-    payload = {"recommendation_id": str(rec.id), "title": rec.title, "description": rec.description, "risk": rec.risk_level, "mode": "simulation"}
+    payload = {"recommendation_id": str(rec.id), "title": rec.title, "description": rec.description,
+        "risk": rec.risk_level, "expected_benefit": rec.expected_benefit,
+        "evidence_refs": rec.evidence_refs, "required_permissions": rec.required_permissions,
+        "verification_steps": rec.verification_steps, "mode": "simulation"}
     digest = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     row = ApprovalRequest(workspace_id=rec.workspace_id, project_id=rec.project_id, recommendation_id=rec.id,
         requested_by=user.id, action_snapshot=payload, action_hash=digest)
@@ -1126,7 +1536,6 @@ def seed_demo_scenario(project_id: UUID, user: User = Depends(current_user), db:
         db.add(EvidenceItem(workspace_id=project.workspace_id, project_id=project.id, incident_id=old.id,
             source_type="historical_incident", source_ref="seeded-demo", summary=old_summary,
             content_hash=sha256(old_summary.encode()).hexdigest(), metadata_json={"demo": True}))
-    from app.services.retrieval import feature_vector
     doc_title = "Checkout API release rollback and connection pool runbook"
     doc_text = "For checkout 5xx errors shortly after a deployment, compare the release timestamp with error-rate changes. Check connection pool limits and dependency timeouts. Rollback requires incident commander approval."
     document = db.query(KnowledgeDocument).filter_by(project_id=project.id, title=doc_title).one_or_none()
@@ -1134,12 +1543,10 @@ def seed_demo_scenario(project_id: UUID, user: User = Depends(current_user), db:
         document = KnowledgeDocument(workspace_id=project.workspace_id, project_id=project.id,
             title=doc_title, source_ref="seeded-runbook", source_kind="runbook",
             content_hash=sha256(doc_text.encode()).hexdigest(), content=doc_text,
-            outcome="A human must validate the cause before rollback.")
+            outcome="A human must validate the cause before rollback.", filename="seeded-runbook.md",
+            mime_type="text/markdown", file_size=len(doc_text.encode()), status="pending",
+            processing_error="Seeded demo content is unembedded until a configured real embedding provider indexes it.")
         db.add(document)
-        db.flush()
-        db.add(DocumentChunk(workspace_id=project.workspace_id, project_id=project.id,
-            document_id=document.id, chunk_index=0, text=doc_text,
-            embedding=feature_vector(doc_title + " " + doc_text), embedding_model="demo-hash-v1"))
     current = Incident(workspace_id=project.workspace_id, project_id=project.id,
         title="Checkout errors increased after release 2.4.0",
         description="Demo scenario: checkout error rate rose shortly after a release. Logs and deployment evidence are seeded; metrics and traces are intentionally unavailable.",

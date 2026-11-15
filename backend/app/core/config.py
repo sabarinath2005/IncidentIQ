@@ -13,6 +13,14 @@ class Settings(BaseSettings):
     llm_provider: str = "mock"
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
+    llm_timeout_seconds: float = Field(default=35, gt=0, le=90)
+    llm_max_retries: int = Field(default=2, ge=0, le=3)
+    embedding_provider: str = "disabled"
+    openai_embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = Field(default=1536, ge=1536, le=1536)
+    embedding_chunk_words: int = Field(default=900, ge=100, le=2000)
+    embedding_chunk_overlap_words: int = Field(default=120, ge=0, le=400)
+    knowledge_max_file_bytes: int = Field(default=2_000_000, ge=1024, le=10_000_000)
     artifact_dir: str = "../var/artifacts"
     seed_demo: bool = True
     frontend_origin: str = "http://localhost:5173"

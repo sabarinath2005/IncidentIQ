@@ -145,6 +145,69 @@ class EvidenceCreate(BaseModel):
     metadata_json: dict = {}
 
 
+class KnowledgeDocumentUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=240)
+    source_kind: Literal["runbook", "troubleshooting_guide", "architecture", "procedure", "incident_summary"] | None = None
+    content: str | None = Field(default=None, min_length=1, max_length=2_000_000)
+    outcome: str | None = Field(default=None, max_length=10000)
+
+
+class GitHubRepositoryMappingCreate(BaseModel):
+    repository_id: str = Field(pattern=r"^[0-9]{1,30}$", max_length=80)
+    repository_full_name: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$", max_length=240)
+    service_id: UUID | None = None
+
+
+class JiraProjectMappingCreate(BaseModel):
+    jira_project_key: str = Field(pattern=r"^[A-Z][A-Z0-9_]{1,39}$")
+    jira_project_name: str = Field(default="", max_length=240)
+
+
+class GitHubRepositoryPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: int = Field(gt=0)
+    full_name: str = Field(min_length=3, max_length=240, pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+class GitHubCommitPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(min_length=7, max_length=100)
+    message: str = Field(default="", max_length=2000)
+    timestamp: datetime | None = None
+    url: str = Field(default="", max_length=1000)
+
+
+class GitHubPushPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    repository: GitHubRepositoryPayload
+    ref: str = Field(default="", max_length=500)
+    after: str = Field(default="", max_length=100)
+    commits: list[GitHubCommitPayload] = Field(default_factory=list, max_length=100)
+    head_commit: GitHubCommitPayload | None = None
+    created: bool = False
+    deleted: bool = False
+
+
+class GitHubReleasePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    repository: GitHubRepositoryPayload
+    action: str = Field(default="published", max_length=40)
+    release: dict
+
+
+class GitHubDeploymentPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    repository: GitHubRepositoryPayload
+    deployment: dict
+
+
+class GitHubDeploymentStatusPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    repository: GitHubRepositoryPayload
+    deployment: dict
+    deployment_status: dict
+
+
 class AlertmanagerAlertPayload(BaseModel):
     status: Literal["firing", "resolved"]
     labels: dict[str, str] = Field(default_factory=dict, max_length=80)

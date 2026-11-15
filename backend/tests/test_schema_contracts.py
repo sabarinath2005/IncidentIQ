@@ -14,6 +14,7 @@ def test_all_domain_tables_are_registered():
         "findings", "finding_evidence_links", "finding_context_links", "recommendations",
         "approval_requests", "remediation_executions", "incident_issue_links", "integrations", "alertmanager_alerts",
         "knowledge_documents", "document_chunks", "outbox_events", "audit_events",
+        "github_repository_mappings", "github_deliveries", "jira_project_mappings", "external_issue_links",
     }
     assert expected <= set(Base.metadata.tables)
 
@@ -70,3 +71,22 @@ def test_every_composite_foreign_key_targets_a_unique_key():
                 if isinstance(constraint, UniqueConstraint)
             ]
             assert target_columns in unique_keys, (table.name, target_table.name, target_columns)
+
+
+def test_ai_and_knowledge_models_record_real_provider_and_source_provenance():
+    run_columns = set(models.InvestigationRun.__table__.columns.keys())
+    assert {"provider_name", "provider_mode", "model_version", "model_duration_ms", "input_tokens", "output_tokens"} <= run_columns
+    assert models.DocumentChunk.__table__.c.embedding.type.dim == 64
+    assert models.DocumentChunk.__table__.c.embedding_1536.type.dim == 1536
+    assert {"embedding_1536_model", "embedding_1536_dimensions"} <= set(models.DocumentChunk.__table__.columns.keys())
+    assert {"status", "processing_error", "version", "chunk_count", "indexed_at"} <= set(models.KnowledgeDocument.__table__.columns.keys())
+    assert "source_chunk_id" in models.InvestigationRunContextReference.__table__.columns
+
+
+def test_external_integrations_have_scoped_idempotency_and_approval_linkage():
+    github = models.GitHubDelivery.__table__
+    assert any(constraint.name == "uq_github_delivery" for constraint in github.constraints)
+    jira = models.ExternalIssueLink.__table__
+    assert any(constraint.name == "uq_external_issue_recommendation_integration" for constraint in jira.constraints)
+    assert any(tuple(element.parent.name for element in fk.elements) == ("workspace_id", "project_id", "recommendation_id")
+               for fk in jira.foreign_key_constraints)
