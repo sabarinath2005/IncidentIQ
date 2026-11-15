@@ -95,7 +95,7 @@ class JiraAdapter:
         jql = f'project = "{project_key}" AND description ~ "{marker}" ORDER BY created DESC'
         try:
             with self._client() as client:
-                response = client.get(self.base_url + "/rest/api/3/search", params={
+                response = client.get(self.base_url + "/rest/api/3/search/jql", params={
                     "jql": jql, "maxResults": 1, "fields": "status"})
         except httpx.HTTPError as exc:
             raise JiraProviderError("Could not verify whether Jira already created the approved issue") from exc

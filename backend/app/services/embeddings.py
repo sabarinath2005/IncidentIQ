@@ -45,7 +45,7 @@ def embed_texts(texts: list[str], transport: httpx.BaseTransport | None = None) 
     with httpx.Client(timeout=timeout, transport=transport) as client:
         for attempt in range(retries + 1):
             try:
-                response = client.post("https://api.openai.com/v1/embeddings",
+                response = client.post(f"{settings.openai_base_url.rstrip('/')}/embeddings",
                     headers={"Authorization": f"Bearer {settings.openai_api_key}"},
                     json={"model": settings.openai_embedding_model, "input": texts,
                           "dimensions": settings.embedding_dimensions})
@@ -72,7 +72,16 @@ def embed_texts(texts: list[str], transport: httpx.BaseTransport | None = None) 
                 raise EmbeddingUnavailable(f"Embedding provider rejected the request (HTTP {response.status_code})")
             try:
                 payload = response.json()
-                rows = sorted(payload["data"], key=lambda item: item["index"])
+                rows = payload["data"]
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise ValueError("Invalid embedding rows")
+                indexed = ["index" in row for row in rows]
+                if any(indexed) and not all(indexed):
+                    raise ValueError("Embedding response mixes indexed and unindexed rows")
+                if all(indexed):
+                    rows = sorted(rows, key=lambda item: item["index"])
+                    if [row["index"] for row in rows] != list(range(len(rows))):
+                        raise ValueError("Embedding response indices are not contiguous")
                 vectors = [[float(value) for value in row["embedding"]] for row in rows]
                 if len(vectors) != len(texts) or any(len(v) != settings.embedding_dimensions for v in vectors):
                     raise ValueError("Unexpected embedding dimensions")

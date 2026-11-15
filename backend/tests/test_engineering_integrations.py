@@ -40,6 +40,7 @@ def test_jira_issue_create_reconciles_using_idempotency_marker(monkeypatch):
 
     def respond(request):
         if request.method == "GET":
+            assert request.url.path == "/rest/api/3/search/jql"
             calls["search"] += 1
             issue = {"id": "1001", "key": "OPS-9", "fields": {"status": {"name": "To Do"}}}
             return httpx.Response(200, json={"issues": [issue] if calls["search"] > 1 else []}, request=request)

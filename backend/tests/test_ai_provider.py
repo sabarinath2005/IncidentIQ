@@ -6,6 +6,7 @@ import pytest
 import app.ai as ai
 from app.ai_providers import AnalysisOutput, ProviderUnavailable, analyze_openai
 from app.core.config import settings
+from app.core.config import Settings
 from langgraph.checkpoint.memory import InMemorySaver
 
 
@@ -25,10 +26,13 @@ def valid_payload():
 def test_real_provider_validates_schema_and_records_metadata(monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "test-only")
     monkeypatch.setattr(settings, "openai_model", "test-model")
+    monkeypatch.setattr(settings, "openai_base_url", "https://api.openai.com/v1")
     requests = {"n": 0}
 
     def respond(request):
         requests["n"] += 1
+        assert str(request.url) == "https://api.openai.com/v1/chat/completions"
+        assert json.loads(request.content)["response_format"]["type"] == "json_schema"
         return httpx.Response(200, json={"model": "test-model-2026-01", "choices": [{
             "message": {"content": json.dumps(valid_payload())}}],
             "usage": {"prompt_tokens": 123, "completion_tokens": 45}}, request=request)
@@ -36,10 +40,42 @@ def test_real_provider_validates_schema_and_records_metadata(monkeypatch):
     result = analyze_openai({"title": "Checkout timeouts"}, [], [], [],
                             transport=httpx.MockTransport(respond))
     assert requests["n"] == 1
+    assert result.output.hypotheses[0].hypothesis
     assert result.output.hypotheses[0].support_ids == ["evidence-1"]
     assert result.metadata["mode"] == "real"
     assert result.metadata["model_version"] == "test-model-2026-01"
     assert result.metadata["input_tokens"] == 123
+
+
+def test_custom_openai_base_url_is_used_for_chat(monkeypatch):
+    monkeypatch.setattr(settings, "openai_api_key", "test-only")
+    monkeypatch.setattr(settings, "openai_model", "compatible-chat-model")
+    monkeypatch.setattr(settings, "openai_base_url", "https://gemini.example/v1/")
+    seen = {}
+
+    def respond(request):
+        seen["url"] = str(request.url)
+        payload = json.loads(request.content)
+        seen["model"] = payload["model"]
+        seen["response_format"] = payload["response_format"]["type"]
+        seen["schema_in_system"] = "risk_assessment" in payload["messages"][0]["content"]
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": json.dumps(valid_payload())}}]}, request=request)
+
+    analyze_openai({}, [], [], [], transport=httpx.MockTransport(respond))
+    assert seen == {"url": "https://gemini.example/v1/chat/completions", "model": "compatible-chat-model",
+                    "response_format": "json_object", "schema_in_system": True}
+
+
+def test_openai_endpoint_and_embedding_model_defaults_and_env_alias(monkeypatch):
+    defaults = Settings(_env_file=None)
+    assert defaults.openai_base_url == "https://api.openai.com/v1"
+    assert defaults.openai_embedding_model == "text-embedding-3-small"
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gemini.example/v1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "gemini-embedding-model")
+    custom = Settings(_env_file=None)
+    assert custom.openai_base_url == "https://gemini.example/v1"
+    assert custom.openai_embedding_model == "gemini-embedding-model"
 
 
 def test_openai_selected_without_key_fails_without_demo_fallback(monkeypatch):

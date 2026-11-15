@@ -41,14 +41,40 @@ def test_openai_embeddings_validate_real_vector_dimensions(monkeypatch):
     monkeypatch.setattr(settings, "embedding_provider", "openai")
     monkeypatch.setattr(settings, "openai_api_key", "test-only")
     monkeypatch.setattr(settings, "embedding_dimensions", 1536)
+    monkeypatch.setattr(settings, "openai_base_url", "https://gemini.example/v1/")
+    monkeypatch.setattr(settings, "openai_embedding_model", "gemini-embedding-model")
+    seen = {}
 
     def respond(request):
+        seen["url"] = str(request.url)
+        seen["body"] = __import__("json").loads(request.content)
         return httpx.Response(200, json={"model": "embedding-test-v1", "data": [{
             "index": 0, "embedding": [0.25] * 1536}]}, request=request)
 
     vectors, model = embed_texts(["real source text"], transport=httpx.MockTransport(respond))
     assert len(vectors) == 1 and len(vectors[0]) == 1536
     assert model == "embedding-test-v1"
+    assert seen["url"] == "https://gemini.example/v1/embeddings"
+    assert seen["body"]["model"] == "gemini-embedding-model"
+    assert seen["body"]["dimensions"] == 1536
+
+
+def test_compatible_embedding_response_without_indexes_preserves_order(monkeypatch):
+    monkeypatch.setattr(settings, "embedding_provider", "openai")
+    monkeypatch.setattr(settings, "openai_api_key", "test-only")
+    monkeypatch.setattr(settings, "embedding_dimensions", 1536)
+
+    def respond(request):
+        return httpx.Response(200, json={"model": "compatible-embedding-v1", "data": [
+            {"object": "embedding", "embedding": [0.25] * 1536},
+            {"object": "embedding", "embedding": [0.75] * 1536},
+        ]}, request=request)
+
+    vectors, model = embed_texts(["first input", "second input"], transport=httpx.MockTransport(respond))
+    assert model == "compatible-embedding-v1"
+    assert len(vectors) == 2
+    assert vectors[0][0] == 0.25
+    assert vectors[1][0] == 0.75
 
 
 def test_embedding_provider_disabled_does_not_fabricate_vectors(monkeypatch):
