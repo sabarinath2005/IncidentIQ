@@ -1,6 +1,10 @@
 services:
   db:
     image: pgvector/pgvector:pg17
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
     environment:
       POSTGRES_DB: incident_platform
       POSTGRES_USER: incident_app
@@ -16,6 +20,10 @@ services:
       retries: 20
   redis:
     image: redis:7-alpine
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     ports:
       - "6379:6379"
     healthcheck:
@@ -25,11 +33,17 @@ services:
       retries: 20
   api:
     build: ./backend
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
     environment:
       DATABASE_URL: postgresql+psycopg://incident_app:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}@db:5432/incident_platform
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in root .env}
       INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-}
+      INTEGRATION_ALLOWED_PRIVATE_HOSTS: ${INTEGRATION_ALLOWED_PRIVATE_HOSTS:-prometheus,alertmanager,loki,tempo,grafana,otel-collector,payment-api}
+      INTEGRATION_ALLOWED_EXTERNAL_HOSTS: ${INTEGRATION_ALLOWED_EXTERNAL_HOSTS:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
@@ -59,11 +73,17 @@ services:
   worker:
     build: ./backend
     user: "10001:10001"
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
     environment:
       DATABASE_URL: postgresql+psycopg://incident_app:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}@db:5432/incident_platform
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in root .env}
       INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-}
+      INTEGRATION_ALLOWED_PRIVATE_HOSTS: ${INTEGRATION_ALLOWED_PRIVATE_HOSTS:-prometheus,alertmanager,loki,tempo,grafana,otel-collector,payment-api}
+      INTEGRATION_ALLOWED_EXTERNAL_HOSTS: ${INTEGRATION_ALLOWED_EXTERNAL_HOSTS:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
@@ -84,15 +104,21 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A app.workers.celery_app worker --loglevel=INFO
+    command: celery -A app.workers.celery_app worker --loglevel=INFO --concurrency=2
   dispatcher:
     build: ./backend
     user: "10001:10001"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     environment:
       DATABASE_URL: postgresql+psycopg://incident_app:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}@db:5432/incident_platform
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in root .env}
       INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-}
+      INTEGRATION_ALLOWED_PRIVATE_HOSTS: ${INTEGRATION_ALLOWED_PRIVATE_HOSTS:-prometheus,alertmanager,loki,tempo,grafana,otel-collector,payment-api}
+      INTEGRATION_ALLOWED_EXTERNAL_HOSTS: ${INTEGRATION_ALLOWED_EXTERNAL_HOSTS:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
@@ -116,6 +142,10 @@ services:
     command: celery -A app.workers.celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
   frontend:
     build: ./frontend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment:
       VITE_API_URL: http://localhost:8000/api/v1
     ports:

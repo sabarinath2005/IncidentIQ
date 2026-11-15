@@ -254,3 +254,14 @@ class ReviewDecision(BaseModel):
 class ApprovalDecision(BaseModel):
     status: str
     note: str = ""
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    limit: int = Field(default=5, ge=1, le=20)
+
+
+class GitHubSimulatePayload(BaseModel):
+    event_type: str = Field(default="deployment_status", max_length=40)
+    repository_full_name: str = Field(default="incidentiq/checkout-service", max_length=240)
+    summary: str = Field(default="Deployment v2.4.0 completed for incidentiq/checkout-service", max_length=1000)

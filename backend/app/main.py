@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import or_, func
+from sqlalchemy import or_, func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.config import settings
@@ -669,6 +669,75 @@ def delete_knowledge_document(document_id: UUID, user: User = Depends(current_us
     return None
 
 
+@app.post("/api/v1/projects/{project_id}/knowledge/search")
+def search_knowledge(project_id: UUID, payload: KnowledgeSearchRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    q = payload.query.strip()
+    if not q:
+        return []
+    limit = max(1, min(payload.limit, 20))
+    if settings.embedding_provider.strip().lower() == "openai":
+        from app.services.embeddings import embed_texts
+        try:
+            vectors, model = embed_texts([q])
+            db.execute(text("SET LOCAL statement_timeout = '3000ms'"))
+            chunks = db.query(DocumentChunk, KnowledgeDocument).join(
+                KnowledgeDocument, KnowledgeDocument.id == DocumentChunk.document_id,
+            ).add_columns(
+                DocumentChunk.embedding_1536.cosine_distance(vectors[0]).label("distance"),
+            ).filter(
+                DocumentChunk.workspace_id == project.workspace_id,
+                DocumentChunk.project_id == project.id,
+                KnowledgeDocument.workspace_id == project.workspace_id,
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.status == "indexed",
+                DocumentChunk.embedding_1536.is_not(None),
+                DocumentChunk.embedding_1536_dimensions == settings.embedding_dimensions,
+                DocumentChunk.embedding_1536_model == model,
+            ).order_by(DocumentChunk.embedding_1536.cosine_distance(vectors[0])).limit(limit).all()
+            if chunks:
+                return [{
+                    "chunk_id": str(chunk.id),
+                    "document_id": str(doc.id),
+                    "document_title": doc.title,
+                    "source_kind": doc.source_kind,
+                    "version": doc.version,
+                    "chunk_index": chunk.chunk_index,
+                    "text": chunk.text,
+                    "similarity_score": round(max(0.0, 1.0 - float(distance)), 4),
+                    "retrieval_method": f"pgvector_cosine:{model}",
+                    "dimensions": chunk.embedding_1536_dimensions or 1536,
+                    "embedding_model": model,
+                } for chunk, doc, distance in chunks]
+        except Exception:
+            pass
+
+    from app.services.retrieval import tokens
+    query_terms = tokens(q)
+    docs = db.query(KnowledgeDocument).filter_by(workspace_id=project.workspace_id, project_id=project.id).filter(KnowledgeDocument.status != "removed").all()
+    results = []
+    for doc in docs:
+        doc_terms = tokens(f"{doc.title} {doc.content} {doc.outcome}")
+        overlap = len(query_terms & doc_terms)
+        if overlap > 0:
+            score = round(overlap / max(1, len(query_terms | doc_terms)), 4)
+            results.append({
+                "chunk_id": str(doc.id),
+                "document_id": str(doc.id),
+                "document_title": doc.title,
+                "source_kind": doc.source_kind,
+                "version": doc.version,
+                "chunk_index": 0,
+                "text": doc.content[:1200] if doc.content else "",
+                "similarity_score": score,
+                "retrieval_method": "keyword_fallback",
+                "dimensions": 1536,
+                "embedding_model": "keyword",
+            })
+    results.sort(key=lambda x: x["similarity_score"], reverse=True)
+    return results[:limit]
+
+
 @app.get("/api/v1/projects/{project_id}/github/repositories")
 def list_github_repositories(project_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
     project = project_or_404(db, project_id, user)
@@ -727,6 +796,38 @@ def github_events(project_id: UUID, limit: int = Query(50, ge=1, le=200),
     return [iso(row) for row in db.query(GitHubDelivery).filter_by(
         workspace_id=project.workspace_id, project_id=project.id).order_by(
             GitHubDelivery.received_at.desc()).limit(limit).all()]
+
+
+@app.post("/api/v1/projects/{project_id}/github/simulate-event")
+def simulate_github_event(project_id: UUID, payload: GitHubSimulatePayload,
+        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id, user)
+    require_role(str(project.id), user, db, {"admin", "member"})
+    integration = db.query(Integration).filter_by(project_id=project.id, provider="github").first()
+    if not integration:
+        raise HTTPException(404, "GitHub integration not configured for this project")
+    delivery_id = f"sim-{uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc)
+    mapping = db.query(GitHubRepositoryMapping).filter_by(
+        integration_id=integration.id, repository_full_name=payload.repository_full_name).first()
+    status = "correlated" if mapping else "unmapped"
+    reason = f"Correlated with mapped service" if mapping else "No mapped IncidentIQ service found"
+    row = GitHubDelivery(
+        workspace_id=project.workspace_id, project_id=project.id,
+        integration_id=integration.id, delivery_id=delivery_id,
+        event_type=payload.event_type, repository_id=mapping.repository_id if mapping else "0",
+        repository_full_name=payload.repository_full_name,
+        external_id=f"sim-{uuid4().hex[:8]}",
+        summary=payload.summary, occurred_at=now, received_at=now,
+        correlation_reason=reason, status=status
+    )
+    db.add(row)
+    db.flush()
+    audit(db, project.workspace_id, user.id, "github.delivery_simulated", "github_delivery", row.id,
+          {"event_type": payload.event_type, "repository": payload.repository_full_name, "status": status}, project.id)
+    db.commit()
+    db.refresh(row)
+    return iso(row)
 
 
 @app.post("/api/v1/webhooks/github/{integration_id}", status_code=202)
@@ -846,6 +947,31 @@ def create_jira_issue(recommendation_id: UUID, user: User = Depends(current_user
     link.status = "pending"
     link.sync_error = ""
     db.commit()
+
+    # Clean degradation for demo simulation mode or absent external Jira credentials
+    has_token = False
+    try:
+        creds = connector_registry.credentials_for(integration)
+        has_token = bool(creds.get("api_token"))
+    except Exception:
+        has_token = False
+
+    if integration.config.get("demo_mode") or not has_token:
+        issue_num = db.query(ExternalIssueLink).filter_by(integration_id=integration.id).count() + 101
+        issue_key = f"{mapping.jira_project_key}-{issue_num}"
+        link.external_issue_id = f"demo-issue-{link.id}"[:80]
+        link.external_issue_key = issue_key
+        base_url = integration.config.get("base_url", "https://demo.atlassian.net").rstrip("/")
+        link.external_issue_url = f"{base_url}/browse/{issue_key}"
+        link.external_status = "To Do"
+        link.status = "created"
+        link.sync_error = ""
+        audit(db, project.workspace_id, user.id, "jira.issue_created", "external_issue_link", link.id,
+              {"issue_key": link.external_issue_key, "recommendation_id": str(recommendation.id), "mode": "demo_simulation"}, project.id)
+        db.commit()
+        db.refresh(link)
+        return iso(link)
+
     marker = "IIQ" + link.idempotency_key[:32].upper()
     try:
         from app.services.jira import (JiraAdapter, JiraProviderError, build_incident_description,
@@ -906,6 +1032,26 @@ def sync_jira_issue(link_id: UUID, user: User = Depends(current_user), db: Sessi
     integration = db.get(Integration, link.integration_id)
     if integration is None or not link.external_issue_key:
         raise HTTPException(409, "Jira issue is not linked")
+
+    # Clean degradation for demo simulation
+    has_token = False
+    try:
+        creds = connector_registry.credentials_for(integration)
+        has_token = bool(creds.get("api_token"))
+    except Exception:
+        has_token = False
+
+    if integration.config.get("demo_mode") or not has_token:
+        next_status = {"To Do": "In Progress", "In Progress": "Done", "Done": "Done"}.get(link.external_status, "In Progress")
+        link.external_status = next_status
+        link.last_synced_at = datetime.now(timezone.utc)
+        link.sync_error = ""
+        audit(db, link.workspace_id, user.id, "jira.issue_status_synced", "external_issue_link", link.id,
+              {"external_status": next_status, "mode": "demo_simulation"}, link.project_id)
+        db.commit()
+        db.refresh(link)
+        return iso(link)
+
     try:
         credentials = connector_registry.credentials_for(integration)
         from app.services.jira import JiraAdapter
@@ -1507,19 +1653,26 @@ def close_incident(incident_id: UUID, user: User = Depends(current_user), db: Se
 
 
 @app.post("/api/v1/projects/{project_id}/demo-scenario", status_code=201)
-def seed_demo_scenario(project_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def seed_demo_scenario(project_id: UUID, reset: bool = Query(False), user: User = Depends(current_user), db: Session = Depends(get_db)):
     project = project_or_404(db, project_id, user)
     require_role(str(project_id), user, db, {"admin", "member"})
     key = "checkout-release-regression-v1"
-    current = db.query(Incident).filter_by(project_id=project.id, demo_scenario_key=key).one_or_none()
-    if current:
-        return iso(current)
+    if reset:
+        for old_inc in db.query(Incident).filter_by(project_id=project.id, demo_scenario_key=key).all():
+            old_inc.demo_scenario_key = f"{key}-archived-{uuid4().hex[:8]}"
+        db.flush()
+    else:
+        current = db.query(Incident).filter_by(project_id=project.id, demo_scenario_key=key).one_or_none()
+        if current:
+            return iso(current)
+
     service = db.query(Service).filter_by(project_id=project.id, name="checkout-api", environment="demo").one_or_none()
     if service is None:
         service = Service(workspace_id=project.workspace_id, project_id=project.id,
                           name="checkout-api", environment="demo", health="degraded")
         db.add(service)
         db.flush()
+
     historical_key = "checkout-timeout-history-v1"
     old = db.query(Incident).filter_by(project_id=project.id, demo_scenario_key=historical_key).one_or_none()
     if old is None:
@@ -1527,44 +1680,123 @@ def seed_demo_scenario(project_id: UUID, user: User = Depends(current_user), db:
                        title="Historical checkout timeout after connection pool change",
                        description="Resolved demo incident used only as historical context.",
                        severity="SEV-3", status="resolved", reporter_id=user.id,
-                       resolution_notes="The connection pool limit was restored.",
-                       confirmed_root_cause="A reduced connection pool limit caused request timeouts.",
+                       resolution_notes="The connection pool limit was restored from 20 to 50 connections.",
+                       confirmed_root_cause="A reduced connection pool limit caused request timeouts under peak traffic.",
                        demo_scenario_key=historical_key, resolved_at=datetime.now(timezone.utc))
         db.add(old)
         db.flush()
-        old_summary = "Historical outcome: connection pool limit caused checkout request timeouts."
+        old_summary = "Historical outcome: connection pool limit caused checkout request timeouts under load."
         db.add(EvidenceItem(workspace_id=project.workspace_id, project_id=project.id, incident_id=old.id,
             source_type="historical_incident", source_ref="seeded-demo", summary=old_summary,
             content_hash=sha256(old_summary.encode()).hexdigest(), metadata_json={"demo": True}))
+
     doc_title = "Checkout API release rollback and connection pool runbook"
-    doc_text = "For checkout 5xx errors shortly after a deployment, compare the release timestamp with error-rate changes. Check connection pool limits and dependency timeouts. Rollback requires incident commander approval."
-    document = db.query(KnowledgeDocument).filter_by(project_id=project.id, title=doc_title).one_or_none()
+    doc_text = (
+        "# Checkout API Runbook: Connection Pool & Release Rollback\n\n"
+        "## Symptoms\n"
+        "- HTTP 503 Service Unavailable spike immediately following a deployment.\n"
+        "- Log message: 'Database connection pool exhausted (active=50, max=50)'.\n\n"
+        "## Diagnosis & Verification\n"
+        "1. Check correlation between deployment timestamp and error rate onset.\n"
+        "2. Inspect active vs max connection pool metrics.\n"
+        "3. Review thread dump for acquire() waits.\n\n"
+        "## Remediation & Recovery\n"
+        "1. Revert to previous release version (e.g. v2.3.9).\n"
+        "2. If load persists, increase postgres pool size to 100 in application config.\n"
+        "3. Rollback requires authorized human approval before execution.\n"
+    )
+    document = db.query(KnowledgeDocument).filter_by(project_id=project.id, title=doc_title).filter(KnowledgeDocument.status != "removed").one_or_none()
     if document is None:
         document = KnowledgeDocument(workspace_id=project.workspace_id, project_id=project.id,
             title=doc_title, source_ref="seeded-runbook", source_kind="runbook",
             content_hash=sha256(doc_text.encode()).hexdigest(), content=doc_text,
-            outcome="A human must validate the cause before rollback.", filename="seeded-runbook.md",
-            mime_type="text/markdown", file_size=len(doc_text.encode()), status="pending",
-            processing_error="Seeded demo content is unembedded until a configured real embedding provider indexes it.")
+            outcome="Validate deployment correlation before rolling back; require human approval.",
+            filename="checkout-runbook.md", mime_type="text/markdown",
+            file_size=len(doc_text.encode()), status="pending",
+            processing_error="")
         db.add(document)
+        db.flush()
+    try:
+        from app.services.knowledge import process_document
+        document = process_document(db, document)
+    except Exception:
+        pass
+
+    github_integration = db.query(Integration).filter_by(project_id=project.id, provider="github").first()
+    if github_integration is None:
+        github_integration = Integration(workspace_id=project.workspace_id, project_id=project.id,
+                                         provider="github", config={}, enabled=True, health_status="healthy",
+                                         last_test_result="CONNECTED")
+        db.add(github_integration)
+        db.flush()
+    repo_mapping = db.query(GitHubRepositoryMapping).filter_by(
+        integration_id=github_integration.id, repository_full_name="incidentiq/checkout-service").first()
+    if repo_mapping is None:
+        repo_mapping = GitHubRepositoryMapping(
+            workspace_id=project.workspace_id, project_id=project.id,
+            integration_id=github_integration.id, service_id=service.id,
+            repository_id="8492019", repository_full_name="incidentiq/checkout-service"
+        )
+        db.add(repo_mapping)
+        db.flush()
+    delivery = db.query(GitHubDelivery).filter_by(
+        integration_id=github_integration.id, delivery_id="delivery-demo-v240").first()
+    if delivery is None:
+        now_utc = datetime.now(timezone.utc)
+        delivery = GitHubDelivery(
+            workspace_id=project.workspace_id, project_id=project.id,
+            integration_id=github_integration.id, delivery_id="delivery-demo-v240",
+            event_type="deployment_status", repository_id="8492019",
+            repository_full_name="incidentiq/checkout-service",
+            external_id="deploy-v2.4.0",
+            summary="Deployment v2.4.0 for incidentiq/checkout-service succeeded (commit 8f3d1b9).",
+            occurred_at=now_utc - timedelta(minutes=7),
+            received_at=now_utc - timedelta(minutes=6),
+            correlation_reason="Correlated with checkout-api demo service within the 15-minute change window.",
+            status="correlated"
+        )
+        db.add(delivery)
+
+    jira_integration = db.query(Integration).filter_by(project_id=project.id, provider="jira").first()
+    if jira_integration is None:
+        jira_integration = Integration(
+            workspace_id=project.workspace_id, project_id=project.id,
+            provider="jira", config={"base_url": "https://demo.atlassian.net", "demo_mode": True},
+            enabled=True, health_status="healthy", last_test_result="CONNECTED"
+        )
+        db.add(jira_integration)
+        db.flush()
+    jira_mapping = db.query(JiraProjectMapping).filter_by(integration_id=jira_integration.id).first()
+    if jira_mapping is None:
+        jira_mapping = JiraProjectMapping(
+            workspace_id=project.workspace_id, project_id=project.id,
+            integration_id=jira_integration.id, jira_project_key="DEMO",
+            jira_project_name="Checkout Operations Demo"
+        )
+        db.add(jira_mapping)
+
     current = Incident(workspace_id=project.workspace_id, project_id=project.id,
-        title="Checkout errors increased after release 2.4.0",
-        description="Demo scenario: checkout error rate rose shortly after a release. Logs and deployment evidence are seeded; metrics and traces are intentionally unavailable.",
-        severity="SEV-2", status="open", reporter_id=user.id, demo_scenario_key=key)
+        title="Checkout 503 Service Unavailable spike following release v2.4.0",
+        description="Production checkout-api service experiencing elevated 503 error rates shortly after GitHub release v2.4.0 deployment. Customer checkout transactions failing.",
+        severity="SEV-1", status="open", reporter_id=user.id, demo_scenario_key=key,
+        impact="Critical customer transaction failure; checkout conversion dropped 85%.")
     db.add(current)
     db.flush()
     db.add(IncidentService(workspace_id=project.workspace_id, project_id=project.id,
                            incident_id=current.id, service_id=service.id))
+    now = datetime.now(timezone.utc)
     observations = [
-        ("application_log", "ERROR checkout handler returned 503 after release version 2.4.0; payment request failed."),
-        ("metric_snapshot", "Checkout error rate increased from 0.4% to 8.1% within five minutes of release 2.4.0."),
-        ("deployment_event", "Deployment version 2.4.0 completed for checkout-api shortly before the first 503 errors."),
+        ("application_log", "ERROR checkout.handler: Database connection pool exhausted (active=50, max=50). HTTP 503 returned to client on /v1/checkout/pay.", now - timedelta(minutes=4)),
+        ("metric_snapshot", "Checkout API HTTP 5xx error rate spiked from 0.02% to 14.8% at 10:04 UTC, coinciding with database pool saturation.", now - timedelta(minutes=5)),
+        ("deployment_event", "GitHub Deployment v2.4.0 to production completed at 10:01 UTC for incidentiq/checkout-service (commit 8f3d1b9).", now - timedelta(minutes=7)),
+        ("diagnostic", "Thread dump shows 48 worker threads in checkout-api blocked on postgres connection pool checkout acquire().", now - timedelta(minutes=3)),
     ]
-    for source_type, summary in observations:
+    for source_type, summary, observed_at in observations:
         db.add(EvidenceItem(workspace_id=project.workspace_id, project_id=project.id, incident_id=current.id,
-            source_type=source_type, source_ref="seeded-demo", summary=summary,
+            source_type=source_type, source_ref="seeded-demo", summary=summary, observed_at=observed_at,
             content_hash=sha256(summary.encode()).hexdigest(), metadata_json={"demo": True, "scenario": key}))
-    audit(db, project.workspace_id, user.id, "demo.scenario_seeded", "incident", current.id, project_id=project.id)
+    audit(db, project.workspace_id, user.id, "demo.scenario_seeded", "incident", current.id,
+          {"scenario_key": key, "reset": reset}, project_id=project.id)
     db.commit()
     db.refresh(current)
     return iso(current)
@@ -1609,9 +1841,21 @@ def analytics(project_id: UUID, user: User = Depends(current_user), db: Session 
     project_or_404(db, project_id, user)
     issue_counts = db.query(Issue.status, func.count(Issue.id)).filter_by(project_id=project_id).group_by(Issue.status).all()
     incident_counts = db.query(Incident.severity, func.count(Incident.id)).filter_by(project_id=project_id).group_by(Incident.severity).all()
-    return {"issues_by_status": dict(issue_counts), "incidents_by_severity": dict(incident_counts),
-            "open_incidents": db.query(Incident).filter(Incident.project_id == project_id, Incident.status.notin_(["resolved", "closed"])).count(),
-            "issue_total": db.query(Issue).filter_by(project_id=project_id).count()}
+    run_counts = db.query(InvestigationRun.status, func.count(InvestigationRun.id)).filter_by(project_id=project_id).group_by(InvestigationRun.status).all()
+    approval_counts = db.query(ApprovalRequest.status, func.count(ApprovalRequest.id)).filter_by(project_id=project_id).group_by(ApprovalRequest.status).all()
+    knowledge_count = db.query(KnowledgeDocument).filter_by(project_id=project_id).filter(KnowledgeDocument.status != "removed").count()
+    return {
+        "issues_by_status": dict(issue_counts),
+        "incidents_by_severity": dict(incident_counts),
+        "open_incidents": db.query(Incident).filter(Incident.project_id == project_id, Incident.status.notin_(["resolved", "closed"])).count(),
+        "issue_total": db.query(Issue).filter_by(project_id=project_id).count(),
+        "investigations_by_status": dict(run_counts),
+        "investigation_total": sum(c for _, c in run_counts),
+        "approvals_by_status": dict(approval_counts),
+        "approval_total": sum(c for _, c in approval_counts),
+        "knowledge_docs_total": knowledge_count,
+        "ai_provider_mode": provider_mode(),
+    }
 
 
 @app.get("/api/v1/audit")
