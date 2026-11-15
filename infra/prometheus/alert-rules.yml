@@ -1,0 +1,21 @@
+groups:
+  - name: payment-api
+    rules:
+      - alert: PaymentApiHighErrorRate
+        expr: sum(rate(payment_http_errors_total{service_name="payment-api"}[2m])) / clamp_min(sum(rate(payment_http_requests_total{service_name="payment-api"}[2m])), 0.001) > 0.10
+        for: 30s
+        labels:
+          severity: critical
+          service_name: payment-api
+        annotations:
+          summary: Payment API error rate is above 10%
+          description: The payment API error ratio has exceeded 10 percent for 30 seconds.
+      - alert: PaymentApiHighLatency
+        expr: histogram_quantile(0.95, sum by (le) (rate(payment_http_request_duration_seconds_bucket{service_name="payment-api"}[5m]))) > 1
+        for: 1m
+        labels:
+          severity: warning
+          service_name: payment-api
+        annotations:
+          summary: Payment API p95 latency is above one second
+          description: Payment API p95 request latency has exceeded one second for one minute.

@@ -1,0 +1,37 @@
+.env
+**/.env
+**/__pycache__/
+**/.pytest_cache/
+**/node_modules/
+**/dist/
+backend/.venv/
+backend/var/
+artifacts/
+infra/alertmanager/local/
+sample/payment-api/*.db
+sample/payment-api/*.db-*
+# Python virtual environments
+.venv/
+venv/
+**/.venv/
+**/venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Frontend dependencies
+**/node_modules/
+
+# Environment secrets
+.env
+**/.env
+.env.*
+!.env.example
+# Test artifacts
+frontend/test-results/
+frontend/playwright-report/
+frontend/playwright/.cache/
+
+# TypeScript build cache
+*.tsbuildinfo

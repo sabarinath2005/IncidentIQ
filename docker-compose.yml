@@ -1,0 +1,175 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: incident_platform
+      POSTGRES_USER: incident_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U incident_app -d incident_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://incident_app:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}@db:5432/incident_platform
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in root .env}
+      INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      FRONTEND_ORIGIN: http://localhost:5173
+      TASK_MODE: celery
+      ARTIFACT_DIR: /app/artifacts
+    ports:
+      - "8000:8000"
+    volumes:
+      - evidence_data:/app/artifacts
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+  worker:
+    build: ./backend
+    user: "10001:10001"
+    environment:
+      DATABASE_URL: postgresql+psycopg://incident_app:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}@db:5432/incident_platform
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in root .env}
+      INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      TASK_MODE: celery
+      ARTIFACT_DIR: /app/artifacts
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=INFO
+  dispatcher:
+    build: ./backend
+    user: "10001:10001"
+    environment:
+      DATABASE_URL: postgresql+psycopg://incident_app:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in root .env}@db:5432/incident_platform
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in root .env}
+      TASK_MODE: celery
+      ARTIFACT_DIR: /app/artifacts
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_API_URL: http://localhost:8000/api/v1
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+  prometheus:
+    image: prom/prometheus:v3.8.1
+    profiles: ["observability"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+  grafana:
+    image: grafana/grafana:12.3.1
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?Set GRAFANA_PASSWORD in root .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+  alertmanager:
+    image: prom/alertmanager:v0.30.1
+    profiles: ["observability"]
+    volumes:
+      - ./infra/alertmanager/local/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./infra/alertmanager/local/webhook-token:/run/secrets/alertmanager_webhook_token:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    depends_on:
+      - api
+  loki:
+    image: grafana/loki:3.6.3
+    profiles: ["observability"]
+    command: ["--config.file=/etc/loki/config.yml"]
+    volumes:
+      - ./infra/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    ports:
+      - "127.0.0.1:3100:3100"
+  tempo:
+    image: grafana/tempo:2.9.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/tempo/config.yml"]
+    volumes:
+      - ./infra/tempo/config.yml:/etc/tempo/config.yml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "127.0.0.1:3200:3200"
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    profiles: ["observability"]
+    command: ["--config=/etc/otelcol-contrib/config.yml"]
+    volumes:
+      - ./infra/otel-collector/config.yml:/etc/otelcol-contrib/config.yml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - loki
+      - tempo
+  payment-api:
+    build: ./sample/payment-api
+    profiles: ["observability"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      DEMO_FAILURES_ENABLED: ${DEMO_FAILURES_ENABLED:-false}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - otel-collector
+volumes:
+  postgres_data:
+  evidence_data:
+  prometheus_data:
+  grafana_data:
+  alertmanager_data:
+  loki_data:
+  tempo_data:
