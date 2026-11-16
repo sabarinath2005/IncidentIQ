@@ -15,7 +15,7 @@ class ProviderUnavailable(RuntimeError):
 
 
 class HypothesisOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     hypothesis: str = Field(min_length=8, max_length=1000)
     explanation: str = Field(min_length=8, max_length=3000)
@@ -30,7 +30,7 @@ class HypothesisOutput(BaseModel):
 
 
 class AnalysisOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     hypotheses: list[HypothesisOutput] = Field(min_length=1, max_length=5)
 
