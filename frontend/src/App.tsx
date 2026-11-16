@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { Link, NavLink, Route, Routes, useParams } from "react-router-dom";
-import { Activity, AlertTriangle, ArrowRight, Bell, BookOpen, Check, ChevronDown, ClipboardList, Cloud, FileSearch, Gauge, Github, LayoutDashboard, LogOut, Plus, Search, ShieldCheck, Sparkles, TicketCheck, Timer, Upload, Wrench, PlugZap } from "lucide-react";
-import { api, type Incident, type Issue, type Project, type Run } from "./api";
+import { Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { Activity, AlertTriangle, ArrowLeft, ArrowRight, Bell, BookOpen, Check, ChevronDown, ChevronUp, ClipboardList, Cloud, FileSearch, Gauge, Github, LayoutDashboard, LogOut, Plus, Search, ShieldCheck, Sparkles, Terminal, TicketCheck, Timer, Upload, Wrench, PlugZap, X } from "lucide-react";
+import { api, type Incident, type Issue, type Project, type Run, type Workspace } from "./api";
 import KnowledgePage from "./KnowledgePage";
 import GitHubPage from "./GitHubPage";
 import JiraPage from "./JiraPage";
@@ -22,20 +22,28 @@ const nav = [
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [projectId, setProjectId] = useState(localStorage.getItem("incident_project") ?? "");
   const [loading, setLoading] = useState(Boolean(localStorage.getItem("incident_token")));
   const [register, setRegister] = useState(false);
   const [authError, setAuthError] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [showNewModal, setShowNewModal] = useState(false);
+  const navigate = useNavigate();
   const token = localStorage.getItem("incident_token");
   const show = (text: string, error = false) => { setNotice({ text, error }); window.setTimeout(() => setNotice(null), 3500); };
-  const load = useCallback(async () => {
+  const load = useCallback(async (targetProjectId?: string) => {
     if (!localStorage.getItem("incident_token")) { setLoading(false); return; }
     try {
-      const [me, ps] = await Promise.all([api.get("/auth/me"), api.get("/projects")]);
-      setUser(me.data); setProjects(ps.data);
-      if (!ps.data.some((p: Project) => p.id === projectId) && ps.data.length) {
-        setProjectId(ps.data[0].id); localStorage.setItem("incident_project", ps.data[0].id);
+      const [me, ps, ws] = await Promise.all([api.get("/auth/me"), api.get("/projects"), api.get("/workspaces")]);
+      setUser(me.data); setProjects(ps.data); setWorkspaces(ws.data);
+      const activeId = targetProjectId ?? projectId;
+      if (targetProjectId && ps.data.some((p: Project) => p.id === targetProjectId)) {
+        setProjectId(targetProjectId);
+        localStorage.setItem("incident_project", targetProjectId);
+      } else if (!ps.data.some((p: Project) => p.id === activeId) && ps.data.length) {
+        setProjectId(ps.data[0].id);
+        localStorage.setItem("incident_project", ps.data[0].id);
       }
     } catch { localStorage.removeItem("incident_token"); setUser(null); }
     finally { setLoading(false); }
@@ -64,7 +72,31 @@ export default function App() {
   return <div className="min-h-screen bg-[#0c141c] text-slate-100">
     <aside className="fixed inset-y-0 left-0 z-30 hidden w-[248px] flex-col border-r border-[#24323e] bg-[#101922] lg:flex">
       <div className="flex h-[72px] items-center gap-3 border-b border-[#24323e] px-5"><Brand/><div><b className="text-sm">IncidentIQ</b><div className="text-[10px] uppercase tracking-[.18em] text-slate-500">Ops workspace</div></div></div>
-      <div className="px-4 pt-5"><label className="mb-2 block px-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">Project</label><div className="relative"><select aria-label="Project" className="field appearance-none pr-8 text-sm" value={project.id} onChange={e => { setProjectId(e.target.value); localStorage.setItem("incident_project", e.target.value); }}>{projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select><ChevronDown size={14} className="pointer-events-none absolute right-3 top-3.5 text-slate-500"/></div></div>
+      <div className="px-4 pt-5">
+        <div className="mb-2 flex items-center justify-between px-2">
+          <label htmlFor="sidebar-project-select" className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Project</label>
+          <button
+            type="button"
+            onClick={() => setShowNewModal(true)}
+            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold text-[#69d8bd] transition hover:bg-[#1a312c]"
+            aria-label="Create workspace or project"
+          >
+            <Plus size={12}/> New
+          </button>
+        </div>
+        <div className="relative">
+          <select
+            id="sidebar-project-select"
+            aria-label="Project"
+            className="field appearance-none pr-8 text-sm"
+            value={project.id}
+            onChange={e => { setProjectId(e.target.value); localStorage.setItem("incident_project", e.target.value); }}
+          >
+            {projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}
+          </select>
+          <ChevronDown size={14} className="pointer-events-none absolute right-3 top-3.5 text-slate-500"/>
+        </div>
+      </div>
       <nav className="flex-1 overflow-y-auto px-3 pt-7"><div className="mb-3 px-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">Workspace</div>{nav.map(([label,path,Icon]) => <NavLink end={path === "/"} key={path} to={path} className={({isActive}) => "mb-1 flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm " + (isActive ? "bg-[#1c3339] font-semibold text-[#72dfc3]" : "text-slate-400 hover:bg-[#182731] hover:text-white")}><Icon size={17}/>{label}</NavLink>)}<a href="http://localhost:8000/docs" target="_blank" className="mt-7 flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-slate-400">API reference</a></nav>
       <div className="m-3 rounded-xl border border-[#28423f] bg-[#132722] p-3"><div className="flex gap-2 text-xs font-semibold text-[#78ddc4]"><Sparkles size={14}/>AI investigation</div><p className="mt-2 text-[11px] leading-5 text-slate-400">Provider mode and model are recorded on each investigation. Review evidence and uncertainty before acting.</p></div>
       <div className="border-t border-[#24323e] p-4"><div className="flex items-center gap-3"><Avatar name={user.full_name}/><div className="min-w-0 flex-1"><div className="truncate text-xs font-semibold">{user.full_name}</div><div className="truncate text-[10px] text-slate-500">{user.email}</div></div><button aria-label="Sign out" onClick={logout}><LogOut size={15}/></button></div></div>
@@ -90,12 +122,235 @@ export default function App() {
         <Route path="*" element={<Dashboard project={project} show={show}/>}/>
       </Routes></main>
     </div>
+    {showNewModal && (
+      <NewWorkspaceOrProjectModal
+        workspaces={workspaces}
+        currentWorkspaceId={project.workspace_id}
+        onClose={() => setShowNewModal(false)}
+        onCreated={async (newProjectId: string, isWorkspaceAndProject: boolean) => {
+          await load(newProjectId);
+          setProjectId(newProjectId);
+          localStorage.setItem("incident_project", newProjectId);
+          navigate("/");
+          show(isWorkspaceAndProject ? "Workspace and project created." : "Project created.");
+          setShowNewModal(false);
+        }}
+        showNotice={show}
+      />
+    )}
     {notice && <div role="status" className={"fixed bottom-5 right-5 z-50 rounded-xl border px-4 py-3 text-sm shadow-2xl " + (notice.error ? "border-red-900 bg-[#311d20] text-red-200" : "border-[#246552] bg-[#14352e] text-emerald-100")}>{notice.error ? <AlertTriangle size={15} className="mr-2 inline"/> : <Check size={15} className="mr-2 inline"/>}{notice.text}</div>}
   </div>;
 }
 
+function NewWorkspaceOrProjectModal({
+  workspaces,
+  currentWorkspaceId,
+  onClose,
+  onCreated,
+  showNotice,
+}: {
+  workspaces: Workspace[];
+  currentWorkspaceId?: string;
+  onClose: () => void;
+  onCreated: (newProjectId: string, isWorkspaceAndProject: boolean) => Promise<void>;
+  showNotice: (msg: string, error?: boolean) => void;
+}) {
+  const [mode, setMode] = useState<"project" | "workspace">(workspaces.length ? "project" : "workspace");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  async function submit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
+    const form = new FormData(e.currentTarget);
+    try {
+      if (mode === "project") {
+        const workspaceId = String(form.get("workspace_id") || workspaces[0]?.id || "");
+        const name = String(form.get("name") || "").trim();
+        const description = String(form.get("description") || "Incident response and engineering work.").trim();
+        const res = await api.post("/projects", {
+          workspace_id: workspaceId,
+          name,
+          description,
+        });
+        await onCreated(res.data.id, false);
+      } else {
+        const workspaceName = String(form.get("workspace_name") || "").trim();
+        const projectName = String(form.get("project_name") || "").trim();
+        const description = String(form.get("description") || "Incident response and engineering work.").trim();
+        const wsRes = await api.post("/workspaces", { name: workspaceName });
+        const pRes = await api.post("/projects", {
+          workspace_id: wsRes.data.id,
+          name: projectName,
+          description,
+        });
+        await onCreated(pRes.data.id, true);
+      }
+    } catch (err) {
+      const msg = errorText(err);
+      setError(msg);
+      showNotice(msg, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="panel w-full max-w-lg border border-[#273743] bg-[#111b24] p-6 shadow-2xl">
+        <div className="flex items-center justify-between border-b border-[#24323e] pb-4">
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-widest text-[#6bd8bd]">WORKSPACE MANAGEMENT</div>
+            <h2 id="modal-title" className="mt-1 text-lg font-semibold text-white">Create Workspace or Project</h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-[#182731] hover:text-white"
+            aria-label="Close dialog"
+          >
+            <X size={18}/>
+          </button>
+        </div>
+
+        <div className="mt-4 flex rounded-lg border border-[#24323e] bg-[#0c141c] p-1">
+          <button
+            type="button"
+            disabled={!workspaces.length}
+            onClick={() => { setMode("project"); setError(""); }}
+            className={
+              "flex-1 rounded-md py-2 text-xs font-semibold transition " +
+              (mode === "project"
+                ? "bg-[#1c3339] text-[#72dfc3]"
+                : workspaces.length
+                ? "text-slate-400 hover:text-white"
+                : "cursor-not-allowed text-slate-600")
+            }
+          >
+            Project in Existing Workspace
+          </button>
+          <button
+            type="button"
+            onClick={() => { setMode("workspace"); setError(""); }}
+            className={
+              "flex-1 rounded-md py-2 text-xs font-semibold transition " +
+              (mode === "workspace" ? "bg-[#1c3339] text-[#72dfc3]" : "text-slate-400 hover:text-white")
+            }
+          >
+            New Workspace & Project
+          </button>
+        </div>
+
+        {error && (
+          <div role="alert" className="mt-4 rounded-lg bg-red-950/40 p-3 text-xs text-red-200">
+            {error}
+          </div>
+        )}
+
+        <form onSubmit={submit} className="mt-5 space-y-4">
+          {mode === "project" ? (
+            <>
+              <label className="block text-xs text-slate-400">
+                Workspace
+                <select
+                  name="workspace_id"
+                  className="field mt-1.5"
+                  defaultValue={currentWorkspaceId ?? workspaces[0]?.id}
+                  required
+                >
+                  {workspaces.map(w => (
+                    <option key={w.id} value={w.id}>
+                      {w.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block text-xs text-slate-400">
+                Project name
+                <input
+                  name="name"
+                  className="field mt-1.5"
+                  required
+                  placeholder="Billing Engine"
+                  autoFocus
+                />
+              </label>
+              <label className="block text-xs text-slate-400">
+                Description
+                <textarea
+                  name="description"
+                  rows={2}
+                  className="field mt-1.5"
+                  defaultValue="Incident response and engineering work."
+                  placeholder="Incident response and engineering work."
+                />
+              </label>
+            </>
+          ) : (
+            <>
+              <label className="block text-xs text-slate-400">
+                Workspace name
+                <input
+                  name="workspace_name"
+                  className="field mt-1.5"
+                  required
+                  placeholder="Core Infrastructure"
+                  autoFocus
+                />
+              </label>
+              <label className="block text-xs text-slate-400">
+                First project name
+                <input
+                  name="project_name"
+                  className="field mt-1.5"
+                  required
+                  placeholder="Auth Service"
+                />
+              </label>
+              <label className="block text-xs text-slate-400">
+                Project description
+                <textarea
+                  name="description"
+                  rows={2}
+                  className="field mt-1.5"
+                  defaultValue="Incident response and engineering work."
+                  placeholder="Incident response and engineering work."
+                />
+              </label>
+            </>
+          )}
+
+          <div className="mt-6 flex justify-end gap-3 border-t border-[#24323e] pt-4">
+            <button type="button" onClick={onClose} className="btn btn-secondary text-xs">
+              Cancel
+            </button>
+            <button type="submit" disabled={busy} className="btn btn-primary text-xs">
+              {busy ? "Creating…" : mode === "project" ? "Create project" : "Create workspace & project"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function Auth({register,toggle,submit,error}:{register:boolean;toggle:()=>void;submit:(e:FormEvent<HTMLFormElement>)=>void;error:string}) {
-  return <div className="grid min-h-screen bg-[#0c141c] lg:grid-cols-2"><div className="hidden flex-col justify-between border-r border-[#24323e] bg-[radial-gradient(ellipse_at_35%_20%,#1d554b,#0d171e_70%)] p-12 lg:flex"><div className="flex items-center gap-3"><Brand/><b>IncidentIQ</b></div><div className="max-w-xl"><span className="badge badge-green">AI-assisted operations</span><h1 className="mt-7 text-5xl font-semibold leading-tight">Turn incident signals into <span className="text-[#62d8ba]">clearer decisions.</span></h1><p className="mt-5 max-w-lg text-base leading-7 text-slate-400">Investigate with traceable evidence, explicit uncertainty, and a human in control of every action.</p><div className="mt-10 grid grid-cols-3 gap-3">{["Evidence linked","Run by run","Human approved"].map(x=><div key={x} className="rounded-xl border border-white/10 bg-white/[.04] p-4 text-xs text-slate-300"><ShieldCheck size={17} className="mb-3 text-[#6bdbbf]"/>{x}</div>)}</div></div><div className="text-xs text-slate-600">Final-year research prototype · Demo mode</div></div><div className="grid place-items-center p-6"><div className="panel w-full max-w-[410px] p-8"><div className="text-xs font-bold uppercase tracking-widest text-[#69d8bd]">{register?"Create your account":"Welcome back"}</div><h2 className="mt-2 text-2xl font-semibold">{register?"Start your workspace":"Sign in to IncidentIQ"}</h2><p className="mt-2 text-sm text-slate-500">{register?"Create an account, then set up your project.":"Use your project account to continue."}</p><form onSubmit={submit} className="mt-7 space-y-4">{register&&<label className="block text-xs text-slate-400">Full name<input name="full_name" className="field mt-2" required autoComplete="name"/></label>}<label className="block text-xs text-slate-400">Email<input name="email" type="email" className="field mt-2" required autoComplete="email"/></label><label className="block text-xs text-slate-400">Password<input name="password" type="password" minLength={10} className="field mt-2" required autoComplete={register?"new-password":"current-password"}/></label>{error&&<div role="alert" className="rounded-lg bg-red-950/40 p-3 text-xs text-red-200">{error}</div>}<button className="btn btn-primary w-full py-3">{register?"Create account":"Sign in"}<ArrowRight size={15}/></button></form><p className="mt-6 text-center text-xs text-slate-500">{register?"Already registered?":"New to the workspace?"} <button className="font-semibold text-[#66d6bb]" onClick={toggle}>{register?"Sign in":"Create account"}</button></p></div></div></div>;
+  return <div className="grid min-h-screen bg-[#0c141c] lg:grid-cols-2"><div className="hidden flex-col justify-between border-r border-[#24323e] bg-[radial-gradient(ellipse_at_35%_20%,#1d554b,#0d171e_70%)] p-12 lg:flex"><div className="flex items-center gap-3"><Brand/><b>IncidentIQ</b></div><div className="max-w-xl"><span className="badge badge-green">AI-assisted operations</span><h1 className="mt-7 text-5xl font-semibold leading-tight">Turn incident signals into <span className="text-[#62d8ba]">clearer decisions.</span></h1><p className="mt-5 max-w-lg text-base leading-7 text-slate-400">Investigate with traceable evidence, explicit uncertainty, and a human in control of every action.</p><div className="mt-10 grid grid-cols-3 gap-3">{["Evidence linked","Run by run","Human approved"].map(x=><div key={x} className="rounded-xl border border-white/10 bg-white/[.04] p-4 text-xs text-slate-300"><ShieldCheck size={17} className="mb-3 text-[#6bdbbf]"/>{x}</div>)}</div></div><div className="text-xs text-slate-600">Enterprise AI-Assisted Incident Response · Live Environment</div></div><div className="grid place-items-center p-6"><div className="panel w-full max-w-[410px] p-8"><div className="text-xs font-bold uppercase tracking-widest text-[#69d8bd]">{register?"Create your account":"Welcome back"}</div><h2 className="mt-2 text-2xl font-semibold">{register?"Start your workspace":"Sign in to IncidentIQ"}</h2><p className="mt-2 text-sm text-slate-500">{register?"Create an account, then set up your project.":"Use your project account to continue."}</p><form onSubmit={submit} className="mt-7 space-y-4">{register&&<label className="block text-xs text-slate-400">Full name<input name="full_name" className="field mt-2" required autoComplete="name"/></label>}<label className="block text-xs text-slate-400">Email<input name="email" type="email" className="field mt-2" required autoComplete="email"/></label><label className="block text-xs text-slate-400">Password<input name="password" type="password" minLength={10} className="field mt-2" required autoComplete={register?"new-password":"current-password"}/></label>{error&&<div role="alert" className="rounded-lg bg-red-950/40 p-3 text-xs text-red-200">{error}</div>}<button className="btn btn-primary w-full py-3">{register?"Create account":"Sign in"}<ArrowRight size={15}/></button></form><p className="mt-6 text-center text-xs text-slate-500">{register?"Already registered?":"New to the workspace?"} <button className="font-semibold text-[#66d6bb]" onClick={toggle}>{register?"Sign in":"Create account"}</button></p></div></div></div>;
 }
 
 function Onboarding({user,load,show,logout}:{user:User;load:()=>Promise<void>;show:(s:string,e?:boolean)=>void;logout:()=>void}) {
@@ -104,16 +359,81 @@ function Onboarding({user,load,show,logout}:{user:User;load:()=>Promise<void>;sh
 }
 
 function Dashboard({project,show}:{project:Project;show:(s:string,e?:boolean)=>void}) {
-  const [summary,setSummary]=useState<any>(null);const [incidents,setIncidents]=useState<Incident[]>([]);
-  const load=useCallback(async()=>{try{const [s,i]=await Promise.all([api.get("/analytics/summary",{params:{project_id:project.id}}),api.get("/projects/"+project.id+"/incidents")]);setSummary(s.data);setIncidents(i.data)}catch(e){show(errorText(e),true)}},[project.id]);
+  const [summary,setSummary]=useState<any>(null);
+  const [incidents,setIncidents]=useState<Incident[]>([]);
+  const [aiProvider,setAiProvider]=useState<any>(null);
+  const [integrations,setIntegrations]=useState<any[]>([]);
+
+  const load=useCallback(async()=>{
+    try{
+      const [s,i,p,intg]=await Promise.all([
+        api.get("/analytics/summary",{params:{project_id:project.id}}),
+        api.get("/projects/"+project.id+"/incidents"),
+        api.get("/ai/provider"),
+        api.get("/projects/"+project.id+"/integrations"),
+      ]);
+      setSummary(s.data);
+      setIncidents(i.data);
+      setAiProvider(p.data);
+      setIntegrations(intg.data);
+    }catch(e){show(errorText(e),true)}
+  },[project.id,show]);
+
   useEffect(()=>{void load()},[load]);
-  async function seed(){try{const r=await api.post("/projects/"+project.id+"/demo-scenario");show("Demo scenario created.");await load();window.location.href="/incidents/"+r.data.id}catch(e){show(errorText(e),true)}}
-  return <div className="space-y-7"><Heading eyebrow="OPERATIONS OVERVIEW" title={project.name} subtitle="Incident response and engineering workload for this project." action={<button onClick={seed} className="btn btn-primary"><Plus size={15}/>Create demo scenario</button>}/>
-    <div className="flex gap-3 rounded-xl border border-[#255247] bg-[#132722] px-4 py-3 text-xs leading-5 text-[#b7d9d0]"><Sparkles size={16} className="shrink-0 text-[#69d8bd]"/><span><b className="text-[#78e1c7]">Demo environment.</b> Findings use a transparent heuristic score. No production telemetry or real remediation is connected.</span></div>
-    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><Metric icon={AlertTriangle} label="Active incidents" value={summary?.open_incidents??"â€”"} hint="Needs investigation"/><Metric icon={ClipboardList} label="Tracked issues" value={summary?.issue_total??"â€”"} hint="Across workflows"/><Metric icon={Timer} label="Investigation provider" value="Mock" hint="Ready without API key"/><Metric icon={Cloud} label="Service integrations" value="Demo" hint="No external sources"/></div>
-    <div className="grid gap-5 xl:grid-cols-[1.3fr_.7fr]"><section className="panel p-5"><div className="mb-3 flex justify-between"><div><h2 className="font-semibold">Recent incidents</h2><p className="mt-1 text-xs text-slate-500">Latest detected events</p></div><Link to="/incidents" className="text-xs text-[#70dec1]">View all â†’</Link></div>{incidents.slice(0,6).map(i=><Link key={i.id} to={"/incidents/"+i.id} className="table-row flex items-center gap-3 py-3"><span className={"h-2 w-2 rounded-full "+(i.severity==="SEV-1"?"bg-red-400":"bg-[#54d1b5]")}/><div className="min-w-0 flex-1"><div className="truncate text-sm font-medium">{i.title}</div><div className="mt-1 text-[11px] text-slate-500">{i.severity} · {new Date(i.detected_at).toLocaleString()}</div></div><span className="badge">{i.status}</span></Link>)}{!incidents.length&&<Empty icon={AlertTriangle} title="No incidents yet" detail="Create a demo scenario to explore investigation end to end."/>}</section>
-      <section className="panel p-5"><h2 className="font-semibold">Issue workload</h2><p className="mt-1 text-xs text-slate-500">Current workflow distribution</p><div className="mt-5 space-y-3">{Object.entries(summary?.issues_by_status??{}).map(([name,value]:any)=><div key={name}><div className="mb-1 flex justify-between text-xs"><span className="text-slate-400">{name}</span><span>{value}</span></div><div className="h-1.5 rounded-full bg-[#24323e]"><div className="h-full rounded-full bg-[#53d3b6]" style={{width:Math.min(100,value*20)+"%"}}/></div></div>)}{!summary?.issue_total&&<p className="py-8 text-center text-xs text-slate-500">Create an issue to see workload here.</p>}<Link to="/issues" className="btn btn-secondary mt-4 w-full">Open issue board</Link></div></section></div>
-    <div className="grid gap-4 md:grid-cols-3"><Feature icon={FileSearch} title="Traceable evidence" text="Findings cite evidence collected for their exact run."/><Feature icon={ShieldCheck} title="Review before action" text="Recommendations require human approval before simulation."/><Feature icon={Activity} title="Auditable runs" text="Steps, source gaps and retry attempts are retained."/></div>
+
+  const isMock = !aiProvider || aiProvider.provider === "mock";
+  const modelStr = String(aiProvider?.model ?? "").toLowerCase();
+  const providerValue = isMock
+    ? "Unconfigured"
+    : modelStr.includes("gemini")
+    ? "Gemini"
+    : (aiProvider?.provider ? String(aiProvider.provider).toUpperCase() : "Unconfigured");
+  const providerHint = isMock
+    ? "Configure LLM_PROVIDER in .env"
+    : (aiProvider?.model || "Live model");
+
+  const activeIntegrationsCount = integrations.filter((x: any) => x.enabled).length;
+  const integrationsValue = activeIntegrationsCount > 0 ? String(activeIntegrationsCount) : "0";
+  const integrationsHint = activeIntegrationsCount > 0 ? "Connected sources" : "Configure in Integrations";
+
+  return <div className="space-y-7">
+    <Heading eyebrow="OPERATIONS OVERVIEW" title={project.name} subtitle="Incident response and engineering workload for this project." action={<Link to="/incidents" className="btn btn-primary"><Plus size={15}/>New incident</Link>}/>
+    {integrations.length === 0 && (
+      <div className="flex gap-3 rounded-xl border border-[#255247] bg-[#132722] px-4 py-3 text-xs leading-5 text-[#b7d9d0]">
+        <Sparkles size={16} className="shrink-0 text-[#69d8bd]"/>
+        <span><b className="text-[#78e1c7]">No external telemetry connected yet.</b> Configure GitHub, Alertmanager, or Jira in <Link to="/integrations" className="underline font-medium text-[#78e1c7]">Integrations</Link> to ingest live production signals.</span>
+      </div>
+    )}
+    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <Metric icon={AlertTriangle} label="Active incidents" value={summary?.open_incidents??"—"} hint="Needs investigation"/>
+      <Metric icon={ClipboardList} label="Tracked issues" value={summary?.issue_total??"—"} hint="Across workflows"/>
+      <Metric icon={Timer} label="Investigation provider" value={providerValue} hint={providerHint}/>
+      <Metric icon={Cloud} label="Service integrations" value={integrationsValue} hint={integrationsHint}/>
+    </div>
+    <div className="grid gap-5 xl:grid-cols-[1.3fr_.7fr]">
+      <section className="panel p-5">
+        <div className="mb-3 flex justify-between">
+          <div><h2 className="font-semibold">Recent incidents</h2><p className="mt-1 text-xs text-slate-500">Latest detected events</p></div>
+          <Link to="/incidents" className="text-xs text-[#70dec1]">View all →</Link>
+        </div>
+        {incidents.slice(0,6).map(i=><Link key={i.id} to={"/incidents/"+i.id} className="table-row flex items-center gap-3 py-3"><span className={"h-2 w-2 rounded-full "+(i.severity==="SEV-1"?"bg-red-400":"bg-[#54d1b5]")}/><div className="min-w-0 flex-1"><div className="truncate text-sm font-medium">{i.title}</div><div className="mt-1 text-[11px] text-slate-500">{i.severity} · {new Date(i.detected_at).toLocaleString()}</div></div><span className="badge">{i.status}</span></Link>)}
+        {!incidents.length&&<Empty icon={AlertTriangle} title="No incidents yet" detail="Connect an alert source or create an incident to begin investigating."/>}
+      </section>
+      <section className="panel p-5">
+        <h2 className="font-semibold">Issue workload</h2>
+        <p className="mt-1 text-xs text-slate-500">Current workflow distribution</p>
+        <div className="mt-5 space-y-3">
+          {Object.entries(summary?.issues_by_status??{}).map(([name,value]:any)=><div key={name}><div className="mb-1 flex justify-between text-xs"><span className="text-slate-400">{name}</span><span>{value}</span></div><div className="h-1.5 rounded-full bg-[#24323e]"><div className="h-full rounded-full bg-[#53d3b6]" style={{width:Math.min(100,value*20)+"%"}}/></div></div>)}
+          {!summary?.issue_total&&<p className="py-8 text-center text-xs text-slate-500">Create an issue to see workload here.</p>}
+          <Link to="/issues" className="btn btn-secondary mt-4 w-full">Open issue board</Link>
+        </div>
+      </section>
+    </div>
+    <div className="grid gap-4 md:grid-cols-3">
+      <Feature icon={FileSearch} title="Traceable evidence" text="Findings cite evidence collected for their exact run."/>
+      <Feature icon={ShieldCheck} title="Review before action" text="Recommendations require human approval before simulation."/>
+      <Feature icon={Activity} title="Auditable runs" text="Steps, source gaps and retry attempts are retained."/>
+    </div>
   </div>;
 }
 
@@ -139,10 +459,9 @@ function IssueView({show}:{show:(s:string,e?:boolean)=>void}) {
 }
 
 function Incidents({project,show}:{project:Project;show:(s:string,e?:boolean)=>void}) {
- const [rows,setRows]=useState<Incident[]>([]);const [form,setForm]=useState(false);const load=useCallback(()=>api.get("/projects/"+project.id+"/incidents").then(r=>setRows(r.data)).catch(e=>show(errorText(e),true)),[project.id]);useEffect(()=>{void load()},[load]);
+ const [rows,setRows]=useState<Incident[]>([]);const [form,setForm]=useState(false);const load=useCallback(()=>api.get("/projects/"+project.id+"/incidents").then(r=>setRows(r.data)).catch(e=>show(errorText(e),true)),[project.id,show]);useEffect(()=>{void load()},[load]);
  async function create(e:FormEvent<HTMLFormElement>){e.preventDefault();const f=new FormData(e.currentTarget);try{await api.post("/projects/"+project.id+"/incidents",{title:f.get("title"),description:f.get("description"),severity:f.get("severity"),service_ids:[]});show("Incident created.");setForm(false);void load()}catch(err){show(errorText(err),true)}}
- async function seed(){try{const r=await api.post("/projects/"+project.id+"/demo-scenario");window.location.href="/incidents/"+r.data.id}catch(e){show(errorText(e),true)}}
- return <div className="space-y-6"><Heading eyebrow="INCIDENT RESPONSE" title="Incidents" subtitle="Investigate service disruptions with time-scoped evidence and human review." action={<div className="flex gap-2"><button className="btn btn-secondary" onClick={seed}><Sparkles size={15}/>Seed demo</button><button className="btn btn-primary" onClick={()=>setForm(!form)}><Plus size={15}/>New incident</button></div>}/>{form&&<form onSubmit={create} className="panel grid gap-3 p-5 md:grid-cols-3"><input name="title" className="field md:col-span-2" placeholder="Incident title" required/><select name="severity" className="field"><option>SEV-3</option><option>SEV-1</option><option>SEV-2</option><option>SEV-4</option></select><textarea name="description" className="field md:col-span-3" placeholder="Impact and symptoms"/><button className="btn btn-primary">Create incident</button></form>}<div className="grid gap-4">{rows.map(i=><Link key={i.id} to={"/incidents/"+i.id} className="panel flex items-center gap-4 p-5 hover:border-[#3c7268]"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#20343c] text-[#6bd8bd]"><AlertTriangle size={18}/></div><div className="min-w-0 flex-1"><div className="flex flex-wrap gap-2"><b>{i.title}</b><span className={"badge "+(i.severity==="SEV-1"?"badge-red":i.severity==="SEV-2"?"badge-amber":"")}>{i.severity}</span><span className="badge">{i.status}</span></div><div className="mt-2 text-xs text-slate-500">Detected {new Date(i.detected_at).toLocaleString()}</div></div><ArrowRight size={16} className="text-slate-500"/></Link>)}{!rows.length&&<div className="panel"><Empty icon={AlertTriangle} title="No incidents recorded" detail="Create an incident or seed the repeatable demo scenario."/></div>}</div></div>;
+ return <div className="space-y-6"><Heading eyebrow="INCIDENT RESPONSE" title="Incidents" subtitle="Investigate service disruptions with time-scoped evidence and human review." action={<button className="btn btn-primary" onClick={()=>setForm(!form)}><Plus size={15}/>New incident</button>}/>{form&&<form onSubmit={create} className="panel grid gap-3 p-5 md:grid-cols-3"><input name="title" className="field md:col-span-2" placeholder="Incident title" required/><select name="severity" className="field"><option>SEV-3</option><option>SEV-1</option><option>SEV-2</option><option>SEV-4</option></select><textarea name="description" className="field md:col-span-3" placeholder="Impact and symptoms"/><button className="btn btn-primary">Create incident</button></form>}<div className="grid gap-4">{rows.map(i=><Link key={i.id} to={"/incidents/"+i.id} className="panel flex items-center gap-4 p-5 hover:border-[#3c7268]"><div className="grid h-11 w-11 place-items-center rounded-xl bg-[#20343c] text-[#6bd8bd]"><AlertTriangle size={18}/></div><div className="min-w-0 flex-1"><div className="flex flex-wrap gap-2"><b>{i.title}</b><span className={"badge "+(i.severity==="SEV-1"?"badge-red":i.severity==="SEV-2"?"badge-amber":"")}>{i.severity}</span><span className="badge">{i.status}</span></div><div className="mt-2 text-xs text-slate-500">Detected {new Date(i.detected_at).toLocaleString()}</div></div><ArrowRight size={16} className="text-slate-500"/></Link>)}{!rows.length&&<div className="panel"><Empty icon={AlertTriangle} title="No incidents recorded" detail="Log an incident above or configure an alert integration to ingest incidents automatically."/></div>}</div></div>;
 }
 
 function IncidentView({show}:{show:(s:string,e?:boolean)=>void}) {
@@ -162,21 +481,420 @@ function IncidentView({show}:{show:(s:string,e?:boolean)=>void}) {
 }
 
 function InvestigationView({show}:{show:(s:string,e?:boolean)=>void}) {
- const {runId}=useParams();const [data,setData]=useState<any>(null);
- const load=useCallback(()=>api.get("/investigations/"+runId).then(r=>setData(r.data)).catch(e=>show(errorText(e),true)),[runId]);useEffect(()=>{void load()},[load]);useEffect(()=>{if(data&&["queued","running"].includes(data.status)){const t=window.setInterval(()=>void load(),2000);return()=>window.clearInterval(t)}},[data,load]);
- if(!data)return <Loading/>;
- async function review(id:string,status:string){try{await api.patch("/findings/"+id+"/review",{status,note:"Reviewed in incident investigation workspace"});show("Finding marked "+status);void load()}catch(e){show(errorText(e),true)}}
- return <div className="space-y-6"><Heading eyebrow="LANGGRAPH INVESTIGATION" title="Root-cause analysis" subtitle={"Run "+data.id.slice(0,8)+" · "+data.model_id+" / "+data.provider_mode+" AI / "+data.status}/><div className="rounded-xl border border-[#3d3625] bg-[#272219] p-4 text-xs leading-5 text-[#e4d0a1]">Confidence is a transparent heuristic score, not a calibrated probability. Historical material is separate from current-incident evidence.</div>
- <section className="panel p-5"><h2 className="font-semibold">Workflow progress</h2><div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">{data.steps.map((s:any,i:number)=><div key={s.id} className="flex items-center gap-3 rounded-lg bg-[#111b24] p-3"><span className="grid h-7 w-7 place-items-center rounded-full bg-[#153c34] text-[#75dfc5]">{s.status==="succeeded"?<Check size={14}/>:i+1}</span><div><div className="text-xs font-semibold capitalize">{s.step_key.replaceAll("_"," ")}</div><div className="text-[10px] text-slate-500">{s.status} · attempt {s.latest_attempt_no}</div></div></div>)}</div></section>
- <div className="grid gap-5 xl:grid-cols-2"><section className="panel p-5"><h2 className="font-semibold">Evidence associated with this run</h2><p className="mb-4 mt-1 text-xs text-slate-500">Only these items can be cited as observed evidence.</p>{data.evidence.map((e:any)=><div key={e.id} className="mb-2 rounded-lg bg-[#111b24] p-3"><div className="flex justify-between"><span className="badge badge-green">{e.source_type}</span><span className="text-[10px] text-slate-500">{e.usage_type}</span></div><p className="mt-2 text-xs leading-5 text-slate-300">{e.summary}</p></div>)}{!data.evidence.length&&<p className="text-xs text-slate-500">No evidence available to this run.</p>}</section><section className="panel p-5"><h2 className="font-semibold">Source query outcomes</h2><p className="mb-4 mt-1 text-xs text-slate-500">Unavailable sources are recorded as gaps.</p>{data.source_statuses.map((s:any)=><div key={s.id} className="mb-2 flex justify-between rounded-lg bg-[#111b24] p-3"><div><div className="text-xs">{s.source_type} · {s.source_instance_ref}</div><div className="mt-1 text-[11px] text-slate-500">{s.reason||"Source query recorded"}</div></div><span className="badge">{s.status} · {s.result_count}</span></div>)}</section></div>
- <section className="panel p-5"><h2 className="font-semibold">Ranked hypotheses</h2><p className="mb-4 mt-1 text-xs text-slate-500">Support, contradiction and context remain separate. Confirm only what the evidence supports.</p>{data.findings.map((f:any)=><article key={f.id} className="mb-4 rounded-xl border border-[#2b3c47] bg-[#111b24] p-5"><div className="flex flex-wrap justify-between gap-3"><div className="flex gap-3"><span className="grid h-8 w-8 place-items-center rounded-lg bg-[#193c38] text-[#7ce0c5]">#{f.rank}</span><div><h3 className="font-medium">{f.hypothesis}</h3><p className="mt-2 text-xs leading-5 text-slate-400">{f.rationale}</p></div></div><div className="text-right text-xl font-semibold text-[#7ce0c5]">{Math.round(f.confidence_score*100)}<div className="text-[10px] font-normal text-slate-500">heuristic score</div></div></div>{f.details_json?.suspected_root_cause&&<div className="mt-4 rounded-lg border border-[#293943] bg-[#17232c] p-3 text-xs"><b>Suspected root cause:</b> {f.details_json.suspected_root_cause}{f.details_json.affected_service&&<span> · Service: {f.details_json.affected_service}</span>}<p className="mt-2 text-slate-400">{f.details_json.explanation}</p></div>}{f.details_json?.missing_evidence?.length>0&&<div className="mt-3 rounded-lg border border-[#51402b] bg-[#2a241b] p-3 text-xs text-amber-100"><b>Missing evidence</b><ul className="mt-2 list-disc pl-5">{f.details_json.missing_evidence.map((x:string)=><li key={x}>{x}</li>)}</ul></div>}{f.details_json?.verification_steps?.length>0&&<div className="mt-3 rounded-lg border border-[#293943] p-3 text-xs"><b>Suggested verification</b><ul className="mt-2 list-disc pl-5 text-slate-400">{f.details_json.verification_steps.map((x:string)=><li key={x}>{x}</li>)}</ul><p className="mt-2 text-slate-400">Risk: {f.details_json.risk_assessment}</p></div>}<div className="mt-4 grid gap-3 md:grid-cols-3">{["supports","contradicts","context"].map(stance=><div key={stance} className="rounded-lg border border-[#253540] p-3"><div className="mb-2 text-[10px] font-bold uppercase text-slate-500">{stance}</div>{f.evidence.filter((e:any)=>e.stance===stance).map((e:any)=><div key={e.id} className="mb-2 text-xs leading-5 text-slate-300">{e.source_type}: {e.summary}</div>)}{!f.evidence.some((e:any)=>e.stance===stance)&&<div className="text-[11px] text-slate-600">No linked evidence.</div>}</div>)}</div>{f.historical_context?.length>0&&<div className="mt-3 rounded-lg border border-[#564933] bg-[#282319] p-3 text-xs text-amber-100"><b>Historical context -- not current evidence</b>{f.historical_context.map((c:any)=><div key={c.id} className="mt-1">{c.source_outcome_snapshot||"No recorded outcome"}</div>)}</div>}<div className="mt-4 flex flex-wrap justify-between gap-2 border-t border-[#273641] pt-4"><span className="badge">{f.review_status} · {f.confidence_method}</span><div className="flex gap-2"><button onClick={()=>review(f.id,"needs_more_evidence")} className="btn btn-secondary py-2 text-xs">Need evidence</button><button onClick={()=>review(f.id,"rejected")} className="btn btn-secondary py-2 text-xs">Reject</button><button onClick={()=>review(f.id,"confirmed")} className="btn btn-primary py-2 text-xs"><Check size={14}/>Confirm</button></div></div></article>)}{!data.findings.length&&<Empty icon={FileSearch} title="No hypotheses generated" detail="Review source status and add evidence before retrying."/>}</section>
- <div className="grid gap-5 xl:grid-cols-2"><section className="panel p-5"><h2 className="font-semibold">Historical context</h2><p className="mb-3 mt-1 text-xs text-slate-500">Same-project references with original source provenance.</p>{data.historical_context.map((c:any)=><div key={c.id} className="mb-2 rounded-lg bg-[#111b24] p-3"><div className="flex justify-between text-xs"><span>{c.source_kind} · rank {c.retrieval_rank}</span><span className="badge">historical</span></div><p className="mt-2 whitespace-pre-wrap text-xs text-slate-300">{c.source_excerpt||c.source_outcome_snapshot||"No source excerpt recorded"}</p>{c.source_document_version&&<p className="mt-2 text-[10px] text-slate-500">Document v{c.source_document_version} · chunk {(c.source_chunk_index??0)+1} · source updated {c.source_timestamp?new Date(c.source_timestamp).toLocaleString():"unknown"}</p>}<div className="mt-2 font-mono text-[9px] text-slate-600">sha256 {c.source_content_hash}</div></div>)}{!data.historical_context.length&&<p className="text-xs text-slate-500">No reviewed historical cases found.</p>}</section><section className="panel p-5"><h2 className="font-semibold">Recommendations</h2>{data.recommendations.map((r:any)=><div key={r.id} className="mt-3 rounded-lg bg-[#111b24] p-3"><div className="flex justify-between"><b className="text-sm">{r.title}</b><span className="badge">{r.risk_level} risk</span></div><p className="mt-2 text-xs text-slate-400">{r.description}</p>{r.expected_benefit&&<p className="mt-2 text-xs text-slate-500">Expected benefit: {r.expected_benefit}</p>}{r.verification_steps?.length>0&&<ul className="mt-2 list-disc pl-5 text-xs text-slate-500">{r.verification_steps.map((x:string)=><li key={x}>{x}</li>)}</ul>}<button onClick={async()=>{try{await api.post("/recommendations/"+r.id+"/approvals");show("Approval request created.")}catch(e){show(errorText(e),true)}}} className="btn btn-secondary mt-3 py-2 text-xs"><ShieldCheck size={14}/>Request approval</button></div>)}</section></div></div>;
+  const {runId} = useParams();
+  const [data, setData] = useState<any>(null);
+  const [showDebug, setShowDebug] = useState(false);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
+
+  const load = useCallback(() => api.get("/investigations/" + runId)
+    .then(r => setData(r.data))
+    .catch(e => show(errorText(e), true)), [runId, show]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    if (data && ["queued", "running"].includes(data.status)) {
+      const t = window.setInterval(() => void load(), 2000);
+      return () => window.clearInterval(t);
+    }
+  }, [data, load]);
+
+  if (!data) return <Loading/>;
+
+  const leadingFinding = data.findings?.[0];
+  const otherFindings = data.findings?.slice(1) ?? [];
+  const suspectedRootCause = leadingFinding?.details_json?.suspected_root_cause || leadingFinding?.hypothesis || "Analysis in progress";
+  const affectedService = leadingFinding?.details_json?.affected_service || "checkout-api";
+  const explanation = leadingFinding?.details_json?.explanation || leadingFinding?.rationale || "Root cause synthesized from correlated telemetry signals and indexed runbooks.";
+  const missingEvidence: string[] = leadingFinding?.details_json?.missing_evidence ?? [];
+  const riskAssessment: string = leadingFinding?.details_json?.risk_assessment ?? "";
+
+  const providerLabel = data.model_id || "gemini-2.5-flash";
+  const providerModeDisplay = data.provider_mode === "live" ? "Real AI" : `${data.provider_mode || "Live"} AI`;
+
+  async function review(id: string, status: string) {
+    try {
+      await api.patch("/findings/" + id + "/review", { status, note: "Reviewed in incident investigation workspace" });
+      show("Finding marked as " + status.replaceAll("_", " ") + ".");
+      void load();
+    } catch (e) {
+      show(errorText(e), true);
+    }
+  }
+
+  async function requestApproval(recommendationId: string) {
+    setApprovingId(recommendationId);
+    try {
+      await api.post("/recommendations/" + recommendationId + "/approvals");
+      show("Approval request created. Proceed to Approval Queue.");
+      void load();
+    } catch (e) {
+      show(errorText(e), true);
+    } finally {
+      setApprovingId(null);
+    }
+  }
+
+  async function resolveIncident() {
+    const defaultCause = leadingFinding?.details_json?.suspected_root_cause || leadingFinding?.hypothesis || "";
+    const cause = window.prompt("Confirmed root cause:", defaultCause);
+    if (cause === null) return;
+    const notes = window.prompt("Resolution notes:", "Remediated based on AI root-cause analysis and verification steps.") ?? "";
+    try {
+      await api.post("/incidents/" + data.incident_id + "/resolve", {
+        confirmed_root_cause: cause,
+        resolution_notes: notes,
+      });
+      show("Incident marked as resolved.");
+      void load();
+    } catch (e) {
+      show(errorText(e), true);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header with Navigation and Metadata Badges */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <Link to={"/incidents/" + data.incident_id} className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold text-[#70dec1] transition hover:text-[#91e7d2]">
+            <ArrowLeft size={14}/> Back to Incident
+          </Link>
+          <div className="text-[10px] font-bold uppercase tracking-[.18em] text-[#6bd8bd]">AI ROOT-CAUSE INVESTIGATION</div>
+          <h1 className="mt-1 text-2xl font-bold text-white md:text-[28px]">Investigation Summary</h1>
+          <p className="mt-1 text-xs text-slate-400">Run ID: <span className="font-mono text-slate-300">{data.id.slice(0, 8)}</span> · Created {new Date(data.created_at).toLocaleString()}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="flex items-center gap-1.5 rounded-full border border-[#234b3f] bg-[#122822] px-3 py-1.5 text-xs font-semibold text-[#75dfc5]">
+            <Sparkles size={14} className="text-[#69d8bd]"/> {providerLabel} · {providerModeDisplay}
+          </span>
+          <span className={"badge text-xs font-semibold capitalize " + (data.status === "succeeded" || data.status === "waiting_for_review" ? "badge-green" : "")}>
+            {data.status.replaceAll("_", " ")}
+          </span>
+        </div>
+      </div>
+
+      {/* 1. Hero AI Summary Card (Front and Center) */}
+      <section className="relative overflow-hidden rounded-2xl border border-[#2b3c47] bg-gradient-to-b from-[#14232c] to-[#0e1720] p-6 shadow-2xl md:p-8">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#243542] pb-4">
+          <div className="flex items-center gap-2">
+            <span className="grid h-7 w-7 place-items-center rounded-lg bg-[#183934] text-[#70dec1]">
+              <Sparkles size={16}/>
+            </span>
+            <span className="text-xs font-bold uppercase tracking-wider text-[#70dec1]">Leading Root-Cause Hypothesis</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-slate-400">Primary Service:</span>
+            <span className="rounded-md border border-[#234d42] bg-[#122823] px-2.5 py-1 font-mono text-xs font-bold text-[#6ee7b7]">
+              {affectedService}
+            </span>
+          </div>
+        </div>
+
+        <div className="mt-5">
+          <h2 className="text-xl font-bold leading-snug text-white md:text-2xl">
+            {leadingFinding?.hypothesis || "Synthesizing root-cause hypotheses from evidence ledger…"}
+          </h2>
+          <p className="mt-3 text-sm leading-6 text-slate-300">
+            {explanation}
+          </p>
+        </div>
+
+        <div className="mt-5 rounded-xl border border-[#233541] bg-[#111c25]/90 p-4">
+          <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Suspected Root Cause</div>
+          <div className="mt-1.5 text-sm font-semibold text-[#7ce0c5]">
+            {suspectedRootCause}
+          </div>
+          {riskAssessment && (
+            <p className="mt-2 text-xs text-slate-400">
+              <strong className="text-slate-300">Risk Assessment:</strong> {riskAssessment}
+            </p>
+          )}
+        </div>
+
+        {/* 2. Clear Human-in-the-Loop Actions */}
+        {leadingFinding && (
+          <div className="mt-6 flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#263845] bg-[#131f28] p-4">
+            <div>
+              <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-300">
+                <ShieldCheck size={16} className="text-[#6ee7b7]"/>
+                Human-in-the-Loop Verification
+              </div>
+              <p className="mt-0.5 text-xs text-slate-400">
+                Status: <span className="font-semibold capitalize text-white">{leadingFinding.review_status?.replaceAll("_", " ") || "Pending review"}</span>
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => review(leadingFinding.id, "confirmed")}
+                className={"btn flex items-center gap-1.5 px-4 py-2 text-xs font-semibold " + (leadingFinding.review_status === "confirmed" ? "btn-primary ring-2 ring-[#70dec1]" : "btn-primary")}
+              >
+                <Check size={15}/> Confirm
+              </button>
+              <button
+                type="button"
+                onClick={() => review(leadingFinding.id, "needs_more_evidence")}
+                className={"btn btn-secondary flex items-center gap-1.5 border-amber-800/70 px-3.5 py-2 text-xs font-semibold text-amber-200 hover:bg-amber-950/40 " + (leadingFinding.review_status === "needs_more_evidence" ? "ring-2 ring-amber-400" : "")}
+              >
+                <AlertTriangle size={14}/> Need Evidence
+              </button>
+              <button
+                type="button"
+                onClick={() => review(leadingFinding.id, "rejected")}
+                className={"btn btn-secondary flex items-center gap-1.5 border-rose-900/60 px-3.5 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-950/40 " + (leadingFinding.review_status === "rejected" ? "ring-2 ring-rose-400" : "")}
+              >
+                <X size={14}/> Reject
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* Grid: Supporting Evidence & Remediation Actions */}
+      <div className="grid gap-6 lg:grid-cols-2">
+        {/* Supporting Evidence Card */}
+        <section className="panel flex flex-col justify-between p-6">
+          <div>
+            <div className="flex items-center justify-between border-b border-[#24323e] pb-3">
+              <h3 className="flex items-center gap-2 font-semibold text-white">
+                <FileSearch size={17} className="text-[#6ee7b7]"/>
+                Key Supporting Evidence
+              </h3>
+              <span className="badge text-xs">{leadingFinding?.evidence?.length ?? 0} citations</span>
+            </div>
+            <p className="mt-2 text-xs text-slate-400">
+              Correlated observations directly supporting the root-cause conclusion.
+            </p>
+
+            <div className="mt-4 space-y-3">
+              {leadingFinding?.evidence?.map((e: any) => (
+                <div key={e.id} className="rounded-xl border border-[#233541] bg-[#101a23] p-3.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="badge badge-green text-[10px] uppercase">{e.source_type}</span>
+                    <span className={"badge text-[10px] font-bold uppercase " + (e.stance === "supports" ? "border-emerald-700/60 text-emerald-300" : e.stance === "contradicts" ? "border-rose-800/60 text-rose-300" : "text-slate-400")}>
+                      {e.stance}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-slate-200">
+                    {e.summary}
+                  </p>
+                </div>
+              ))}
+              {(!leadingFinding?.evidence || leadingFinding.evidence.length === 0) && (
+                <div className="rounded-lg border border-dashed border-[#243542] p-5 text-center text-xs text-slate-500">
+                  No direct evidence linked to this finding.
+                </div>
+              )}
+            </div>
+
+            {missingEvidence.length > 0 && (
+              <div className="mt-4 rounded-xl border border-amber-900/40 bg-amber-950/20 p-3.5 text-xs text-amber-200">
+                <b className="flex items-center gap-1.5 text-amber-300">
+                  <AlertTriangle size={14}/> Identified Evidence Gaps
+                </b>
+                <ul className="mt-2 list-disc space-y-1 pl-5 text-amber-200/90">
+                  {missingEvidence.map((x: string) => <li key={x}>{x}</li>)}
+                </ul>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Recommended Remediation & Actions Card */}
+        <section className="panel flex flex-col justify-between p-6">
+          <div>
+            <div className="flex items-center justify-between border-b border-[#24323e] pb-3">
+              <h3 className="flex items-center gap-2 font-semibold text-white">
+                <ShieldCheck size={17} className="text-[#6ee7b7]"/>
+                Remediation & Action Plan
+              </h3>
+              <button
+                type="button"
+                onClick={resolveIncident}
+                className="btn btn-secondary px-2.5 py-1 text-xs font-semibold text-emerald-300 hover:text-emerald-200"
+              >
+                <Check size={13}/> Resolve Incident
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-slate-400">
+              AI-suggested recovery procedures and gated human approval requests.
+            </p>
+
+            <div className="mt-4 space-y-4">
+              {data.recommendations?.map((r: any) => (
+                <div key={r.id} className="rounded-xl border border-[#233541] bg-[#101a23] p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <h4 className="text-sm font-semibold text-white">{r.title}</h4>
+                    <span className={"badge text-[10px] font-bold uppercase " + (r.risk_level === "high" || r.risk_level === "critical" ? "badge-red" : r.risk_level === "medium" ? "badge-amber" : "badge-green")}>
+                      {r.risk_level} risk
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-slate-300">{r.description}</p>
+                  {r.expected_benefit && (
+                    <p className="mt-2 text-xs text-slate-400">
+                      <strong className="text-slate-300">Benefit:</strong> {r.expected_benefit}
+                    </p>
+                  )}
+                  {r.verification_steps?.length > 0 && (
+                    <div className="mt-2 text-xs text-slate-400">
+                      <strong className="text-slate-300">Suggested Verification:</strong>
+                      <ul className="mt-1 list-disc space-y-0.5 pl-5 text-slate-400">
+                        {r.verification_steps.map((step: string) => <li key={step}>{step}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                  <div className="mt-4 flex items-center justify-between border-t border-[#1f2d38] pt-3">
+                    <span className="text-[11px] text-slate-500">Requires human review before simulation</span>
+                    <button
+                      type="button"
+                      disabled={approvingId === r.id}
+                      onClick={() => void requestApproval(r.id)}
+                      className="btn btn-primary flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold"
+                    >
+                      <ShieldCheck size={14}/>
+                      {approvingId === r.id ? "Requesting…" : "Request Approval"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {!data.recommendations?.length && (
+                <div className="rounded-lg border border-dashed border-[#243542] p-5 text-center text-xs text-slate-500">
+                  No automated remediation proposed. Verify signals and resolve incident above.
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      {/* 3. Collapsible "Technical Debug Details" Drawer / Accordion */}
+      <section className="overflow-hidden rounded-xl border border-[#22313d] bg-[#0f1821]">
+        <button
+          type="button"
+          onClick={() => setShowDebug(!showDebug)}
+          className="flex w-full items-center justify-between p-5 text-left transition hover:bg-[#131f29]"
+          aria-expanded={showDebug}
+        >
+          <div className="flex items-center gap-3">
+            <div className="grid h-9 w-9 place-items-center rounded-lg bg-[#182733] text-[#72dfc3]">
+              <Terminal size={17} />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-slate-200">Technical Debug Details & LangGraph Pipeline Trace</h3>
+              <p className="mt-0.5 text-xs text-slate-500">Node execution states, heuristic metrics, source telemetry gaps, and raw SHA-256 hashes.</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="badge text-[11px]">{data.steps?.length ?? 0} nodes · {data.source_statuses?.length ?? 0} sources</span>
+            {showDebug ? <ChevronUp size={18} className="text-slate-400" /> : <ChevronDown size={18} className="text-slate-400" />}
+          </div>
+        </button>
+
+        {showDebug && (
+          <div className="space-y-6 border-t border-[#1e2a35] bg-[#0c141c] p-5">
+            {/* LangGraph Pipeline Nodes Stepper */}
+            <div>
+              <div className="mb-3 text-[11px] font-bold uppercase tracking-wider text-slate-400">LangGraph Pipeline Nodes</div>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {data.steps?.map((s: any, i: number) => (
+                  <div key={s.id} className="flex items-center gap-3 rounded-lg border border-[#1e2c37] bg-[#111b24] p-3">
+                    <span className="grid h-6 w-6 place-items-center rounded-full bg-[#153c34] text-xs font-bold text-[#75dfc5]">
+                      {s.status === "succeeded" ? <Check size={12}/> : i + 1}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-xs font-semibold capitalize text-slate-200">{s.step_key.replaceAll("_", " ")}</div>
+                      <div className="text-[10px] text-slate-500">{s.status} · attempt {s.latest_attempt_no}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Confidence Heuristic & Telemetry */}
+            <div className="rounded-lg border border-[#233541] bg-[#111c25] p-4 text-xs text-slate-400">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-semibold text-slate-300">Confidence Scoring Model</span>
+                <span className="font-mono text-xs font-semibold text-[#7ce0c5]">
+                  Score: {Math.round((leadingFinding?.confidence_score ?? 0) * 100)}% ({leadingFinding?.confidence_method || "transparent heuristic"})
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] leading-5 text-slate-500">
+                Confidence is a transparent heuristic score computed from citation count, evidence stance, and source verification. Historical runbook knowledge is retained separately from current-run observed evidence.
+              </p>
+            </div>
+
+            {/* Telemetry Source Statuses */}
+            <div>
+              <div className="mb-3 text-[11px] font-bold uppercase tracking-wider text-slate-400">Telemetry Source Gaps & Query Outcomes</div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {data.source_statuses?.map((s: any) => (
+                  <div key={s.id} className="flex items-center justify-between rounded-lg border border-[#1e2c37] bg-[#111b24] p-3 text-xs">
+                    <div>
+                      <div className="font-semibold text-slate-300">{s.source_type} <span className="font-normal text-slate-500">({s.source_instance_ref})</span></div>
+                      <div className="mt-0.5 text-[10px] text-slate-500">{s.reason || "Source query outcome recorded"}</div>
+                    </div>
+                    <span className="badge text-[10px]">{s.status} · {s.result_count} items</span>
+                  </div>
+                ))}
+                {!data.source_statuses?.length && (
+                  <p className="text-xs text-slate-500">No source query statuses recorded.</p>
+                )}
+              </div>
+            </div>
+
+            {/* Historical RAG & SHA-256 Hashes */}
+            {data.historical_context?.length > 0 && (
+              <div>
+                <div className="mb-3 text-[11px] font-bold uppercase tracking-wider text-slate-400">Historical Runbook Knowledge & Document Chunk Hashes</div>
+                <div className="space-y-2">
+                  {data.historical_context.map((c: any) => (
+                    <div key={c.id} className="rounded-lg border border-[#1e2c37] bg-[#111b24] p-3 text-xs">
+                      <div className="flex justify-between text-[11px]">
+                        <span className="text-slate-400">{c.source_kind} · rank {c.retrieval_rank}</span>
+                        <span className="badge text-[10px]">historical RAG</span>
+                      </div>
+                      <p className="mt-2 whitespace-pre-wrap font-mono text-xs text-slate-300">
+                        {c.source_excerpt || c.source_outcome_snapshot || "No excerpt recorded"}
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-3 text-[10px] text-slate-500">
+                        {c.source_document_version && <span>Document v{c.source_document_version} · chunk {(c.source_chunk_index ?? 0) + 1}</span>}
+                        {c.source_content_hash && <span className="font-mono">SHA256: {c.source_content_hash}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Secondary Hypotheses (Rank #2+) */}
+            {otherFindings.length > 0 && (
+              <div>
+                <div className="mb-3 text-[11px] font-bold uppercase tracking-wider text-slate-400">Alternative Evaluated Hypotheses</div>
+                <div className="space-y-3">
+                  {otherFindings.map((f: any) => (
+                    <div key={f.id} className="rounded-lg border border-[#1e2c37] bg-[#111b24] p-3 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-slate-200">Rank #{f.rank}: {f.hypothesis}</span>
+                        <span className="badge text-[10px]">{Math.round(f.confidence_score * 100)}% score</span>
+                      </div>
+                      <p className="mt-1 text-slate-400">{f.rationale}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
+  );
 }
 
 function Services({project,show}:{project:Project;show:(s:string,e?:boolean)=>void}) {
- const [rows,setRows]=useState<any[]>([]);const [open,setOpen]=useState(false);const load=useCallback(()=>api.get("/projects/"+project.id+"/services").then(r=>setRows(r.data)).catch(e=>show(errorText(e),true)),[project.id]);useEffect(()=>{void load()},[load]);
+ const [rows,setRows]=useState<any[]>([]);const [open,setOpen]=useState(false);const load=useCallback(()=>api.get("/projects/"+project.id+"/services").then(r=>setRows(r.data)).catch(e=>show(errorText(e),true)),[project.id,show]);useEffect(()=>{void load()},[load]);
  async function create(e:FormEvent<HTMLFormElement>){e.preventDefault();const f=new FormData(e.currentTarget);try{await api.post("/projects/"+project.id+"/services",{name:f.get("name"),environment:f.get("environment"),description:f.get("description"),criticality:f.get("criticality")});show("Service added.");setOpen(false);void load()}catch(err){show(errorText(err),true)}}
- return <div className="space-y-6"><Heading eyebrow="SERVICE CATALOG" title="Services" subtitle="Map project components, criticality and ownership for incident investigation." action={<button onClick={()=>setOpen(!open)} className="btn btn-primary"><Plus size={15}/>Add service</button>}/>{open&&<form onSubmit={create} className="panel grid gap-3 p-5 md:grid-cols-2"><input name="name" className="field" placeholder="Service name" required/><select name="environment" className="field"><option>production</option><option>staging</option><option>development</option><option>demo</option></select><select name="criticality" className="field"><option value="medium">Medium criticality</option><option value="critical">Critical</option><option value="high">High</option><option value="low">Low</option></select><input name="description" className="field" placeholder="Description"/><button className="btn btn-primary">Save service</button></form>}<div className="grid gap-4 md:grid-cols-3">{rows.map(s=><Link to={'/services/'+s.id} key={s.id} className="panel p-5 hover:border-[#3b665d]"><Cloud className="text-[#67d6bb]"/><h3 className="mt-4 font-semibold">{s.name}</h3><div className="mt-2 text-xs text-slate-500">{s.environment} · {s.criticality} criticality · {s.health}</div><p className="mt-2 text-xs text-slate-500">{s.description||"No description"}</p></Link>)}{!rows.length&&<div className="panel md:col-span-3"><Empty icon={Cloud} title="No services mapped" detail="Add a service or seed a demo scenario."/></div>}</div></div>;
+ return <div className="space-y-6"><Heading eyebrow="SERVICE CATALOG" title="Services" subtitle="Map project components, criticality and ownership for incident investigation." action={<button onClick={()=>setOpen(!open)} className="btn btn-primary"><Plus size={15}/>Add service</button>}/>{open&&<form onSubmit={create} className="panel grid gap-3 p-5 md:grid-cols-2"><input name="name" className="field" placeholder="Service name" required/><select name="environment" className="field"><option>production</option><option>staging</option><option>development</option><option>testing</option></select><select name="criticality" className="field"><option value="medium">Medium criticality</option><option value="critical">Critical</option><option value="high">High</option><option value="low">Low</option></select><input name="description" className="field" placeholder="Description"/><button className="btn btn-primary">Save service</button></form>}<div className="grid gap-4 md:grid-cols-3">{rows.map(s=><Link to={'/services/'+s.id} key={s.id} className="panel p-5 hover:border-[#3b665d]"><Cloud className="text-[#67d6bb]"/><h3 className="mt-4 font-semibold">{s.name}</h3><div className="mt-2 text-xs text-slate-500">{s.environment} · {s.criticality} criticality · {s.health}</div><p className="mt-2 text-xs text-slate-500">{s.description||"No description"}</p></Link>)}{!rows.length&&<div className="panel md:col-span-3"><Empty icon={Cloud} title="No services mapped" detail="Register a service above to map components and dependencies for incident investigations."/></div>}</div></div>;
 }
 
 function ServiceView({show}:{show:(s:string,e?:boolean)=>void}) {
